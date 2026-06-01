@@ -39,8 +39,16 @@ jobs:
         shell: pwsh
         run: |
           npm run package 2>&1 | Tee-Object -FilePath build-windows.log
-          if ($LASTEXITCODE -ne 0) {
-            exit $LASTEXITCODE
+          $exitCode = $LASTEXITCODE
+          if ($exitCode -ne 0) {
+            if (Test-Path build-windows.log) {
+              $tail = [string]::Join([Environment]::NewLine, (Get-Content build-windows.log -Tail 120))
+            } else {
+              $tail = "build-windows.log was not created."
+            }
+            $escaped = $tail.Replace("%", "%25").Replace("`r", "%0D").Replace("`n", "%0A")
+            Write-Host "::error title=Windows packaging failed::$escaped"
+            exit $exitCode
           }
 
       - name: Upload installer
