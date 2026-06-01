@@ -36,7 +36,12 @@ jobs:
         run: npm test
 
       - name: Build Windows installer
-        run: npm run package
+        shell: pwsh
+        run: |
+          npm run package 2>&1 | Tee-Object -FilePath build-windows.log
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
 
       - name: Upload installer
         uses: actions/upload-artifact@v4
@@ -44,3 +49,11 @@ jobs:
           name: mihomo-server-manager-windows
           path: src-tauri/target/release/bundle/nsis/*.exe
           if-no-files-found: error
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-windows-log
+          path: build-windows.log
+          if-no-files-found: ignore
