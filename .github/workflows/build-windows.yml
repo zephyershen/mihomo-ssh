@@ -9,7 +9,9 @@ on:
 jobs:
   build-windows:
     name: Build NSIS installer
-    runs-on: windows-latest
+    runs-on: windows-2022
+    env:
+      RUST_BACKTRACE: 1
 
     steps:
       - name: Checkout
@@ -26,6 +28,12 @@ jobs:
 
       - name: Install frontend dependencies
         run: npm ci
+
+      - name: Check frontend
+        run: npm run build
+
+      - name: Test frontend
+        run: npm test
 
       - name: Build Windows installer
         run: npm run package

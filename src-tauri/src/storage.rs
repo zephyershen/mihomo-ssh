@@ -192,7 +192,7 @@ impl Storage {
 
     pub fn list_logs(&self, server_id: Option<i64>, limit: u32) -> Result<Vec<OperationLog>, String> {
         let conn = self.connect()?;
-        let limit = limit.clamp(1, 500);
+        let limit = i64::from(limit.clamp(1, 500));
 
         if let Some(server_id) = server_id {
             let mut stmt = conn
