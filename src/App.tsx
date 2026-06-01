@@ -25,9 +25,15 @@ import {
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { api } from "./lib/api";
 import { redactForDisplay } from "./lib/redaction";
+import {
+  checkForAppUpdate,
+  downloadInstallAndRelaunch,
+  type AppUpdateProgress,
+  type AppUpdateStatus,
+} from "./lib/updater";
 import type { CommandResult, OperationLog, ProxyGroup, ProxyNode, Server, ServerHealth } from "./types";
 
-type Tab = "overview" | "install" | "subscription" | "nodes" | "config" | "logs";
+type Tab = "overview" | "install" | "subscription" | "nodes" | "config" | "logs" | "updates";
 
 const tabs: Array<{ id: Tab; label: string; icon: typeof Activity }> = [
   { id: "overview", label: "概览", icon: Gauge },
@@ -36,6 +42,7 @@ const tabs: Array<{ id: Tab; label: string; icon: typeof Activity }> = [
   { id: "nodes", label: "节点", icon: Network },
   { id: "config", label: "配置", icon: Settings },
   { id: "logs", label: "日志", icon: TerminalSquare },
+  { id: "updates", label: "更新", icon: Download },
 ];
 
 export function App() {
@@ -52,6 +59,11 @@ export function App() {
   const [measuredNodes, setMeasuredNodes] = useState<ProxyNode[]>([]);
   const [logs, setLogs] = useState("");
   const [operationLogs, setOperationLogs] = useState<OperationLog[]>([]);
+  const [updateStatus, setUpdateStatus] = useState<AppUpdateStatus | null>(null);
+  const [updateProgress, setUpdateProgress] = useState<AppUpdateProgress>({
+    phase: "idle",
+    message: "",
+  });
 
   const selected = useMemo(
     () => servers.find((server) => server.id === selectedId) ?? null,
@@ -150,6 +162,30 @@ export function App() {
     await run("读取日志", () => api.readMihomoLogs(selected.id, 240), (value) =>
       setLogs(redactForDisplay(value)),
     );
+  }
+
+  async function checkUpdates() {
+    setUpdateProgress({ phase: "checking", message: "正在检查更新" });
+    const result = await run("检查软件更新", checkForAppUpdate, (value) => {
+      setUpdateStatus(value);
+      setUpdateProgress({ phase: "idle", message: "" });
+    });
+    if (!result) {
+      setUpdateProgress({ phase: "error", message: "检查更新失败" });
+    }
+  }
+
+  async function installUpdate() {
+    setBusy("安装软件更新");
+    setToast("");
+    try {
+      await downloadInstallAndRelaunch(setUpdateProgress);
+    } catch (error) {
+      setUpdateProgress({ phase: "error", message: String(error) });
+      setToast(`安装更新失败：${String(error)}`);
+    } finally {
+      setBusy(null);
+    }
   }
 
   const currentGroup = groups.find((group) => group.name === selectedGroup);
@@ -305,6 +341,16 @@ export function App() {
               onReadOps={() => refreshOperationLogs()}
             />
           )}
+
+          {activeTab === "updates" && (
+            <UpdatesPanel
+              busy={busy}
+              updateStatus={updateStatus}
+              progress={updateProgress}
+              onCheck={checkUpdates}
+              onInstall={installUpdate}
+            />
+          )}
         </section>
 
         {(busy || toast) && (
@@ -314,6 +360,81 @@ export function App() {
           </div>
         )}
       </main>
+    </div>
+  );
+}
+
+function UpdatesPanel(props: {
+  busy: string | null;
+  updateStatus: AppUpdateStatus | null;
+  progress: AppUpdateProgress;
+  onCheck: () => void;
+  onInstall: () => void;
+}) {
+  const { updateStatus, progress } = props;
+  const progressText =
+    progress.total && progress.downloaded != null
+      ? `${Math.round((progress.downloaded / progress.total) * 100)}%`
+      : progress.message;
+
+  return (
+    <div className="split-layout">
+      <div className="work-panel">
+        <div className="panel-title">Software Update</div>
+        <div className={`update-card ${updateStatus?.state ?? "idle"}`}>
+          {updateStatus?.state === "available" ? (
+            <>
+              <strong>Version {updateStatus.version}</strong>
+              <span>{updateStatus.date ?? "Release available"}</span>
+            </>
+          ) : updateStatus ? (
+            <>
+              <strong>{updateStatus.state === "current" ? "Up to date" : "Update unavailable"}</strong>
+              <span>{updateStatus.message}</span>
+            </>
+          ) : (
+            <>
+              <strong>Not checked</strong>
+              <span>Release builds can check GitHub Releases for signed updates.</span>
+            </>
+          )}
+        </div>
+
+        <div className="button-row">
+          <button className="command-button" disabled={!!props.busy} onClick={props.onCheck}>
+            <RefreshCcw size={17} />
+            Check
+          </button>
+          <button
+            className="command-button primary"
+            disabled={!!props.busy || updateStatus?.state !== "available"}
+            onClick={props.onInstall}
+          >
+            <Download size={17} />
+            Install
+          </button>
+        </div>
+
+        {progress.message && (
+          <div className={`update-progress ${progress.phase}`}>
+            {progress.phase === "downloading" && progress.total ? (
+              <div className="progress-bar" aria-label="Update download progress">
+                <span style={{ width: progressText }} />
+              </div>
+            ) : null}
+            <span>{progressText}</span>
+          </div>
+        )}
+      </div>
+
+      <div className="output-panel">
+        <div className="panel-title">Release Notes</div>
+        <pre>
+          {updateStatus?.state === "available"
+            ? updateStatus.body || "No release notes provided."
+            : "No update release notes loaded."}
+        </pre>
+      </div>
     </div>
   );
 }

@@ -1,0 +1,110 @@
+name: Release Windows Installer
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag, for example v0.1.1
+        required: true
+        default: v0.1.1
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+
+jobs:
+  release-windows:
+    name: Build signed Windows release
+    runs-on: windows-2022
+    env:
+      RUST_BACKTRACE: 1
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Validate updater secrets
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace("${{ secrets.TAURI_UPDATER_PUBLIC_KEY }}")) {
+            throw "Missing GitHub secret: TAURI_UPDATER_PUBLIC_KEY"
+          }
+          if ([string]::IsNullOrWhiteSpace("${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}")) {
+            throw "Missing GitHub secret: TAURI_SIGNING_PRIVATE_KEY"
+          }
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build frontend
+        run: npm run build
+
+      - name: Test frontend
+        run: npm test
+
+      - name: Generate release updater config
+        shell: pwsh
+        run: |
+          $tag = "${{ env.RELEASE_TAG }}"
+          if ($tag -notmatch '^v?(?<version>\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)$') {
+            throw "Release tag must look like v0.1.1; got '$tag'"
+          }
+          $version = $Matches.version
+          $pubkey = @'
+          ${{ secrets.TAURI_UPDATER_PUBLIC_KEY }}
+          '@.Trim()
+          $config = @{
+            version = $version
+            bundle = @{
+              createUpdaterArtifacts = $true
+            }
+            plugins = @{
+              updater = @{
+                pubkey = $pubkey
+                endpoints = @(
+                  "https://github.com/zephyershen/mihomo-ssh/releases/latest/download/latest.json"
+                )
+                windows = @{
+                  installMode = "passive"
+                }
+              }
+            }
+          } | ConvertTo-Json -Depth 12
+          Set-Content -Path src-tauri/tauri.release.conf.json -Value $config -Encoding UTF8
+
+      - name: Build and publish release
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: ${{ env.RELEASE_TAG }}
+          releaseName: Mihomo Server Manager ${{ env.RELEASE_TAG }}
+          releaseBody: Windows installer and signed updater metadata for Mihomo Server Manager.
+          releaseCommitish: ${{ github.sha }}
+          releaseDraft: false
+          prerelease: false
+          tauriScript: npm run tauri --
+          args: --bundles nsis --config src-tauri/tauri.release.conf.json
+          updaterJsonPreferNsis: true
+          uploadUpdaterJson: true
+          uploadUpdaterSignatures: true
+          uploadWorkflowArtifacts: true
+          workflowArtifactNamePattern: mihomo-server-manager-[platform]-[arch]-[bundle]
