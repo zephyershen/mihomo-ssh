@@ -159,7 +159,7 @@ pub async fn measure_proxy_delay(port: u16, group: &str) -> Result<Vec<ProxyNode
             Ok(response) if response.status().is_success() => {
                 let value: Value = response.json().await.unwrap_or(Value::Null);
                 node.delay_ms = value.get("delay").and_then(Value::as_u64);
-                node.alive = node.delay_ms.is_some();
+                node.alive = Some(node.delay_ms.is_some());
             }
             _ => {
                 node.delay_ms = None;
