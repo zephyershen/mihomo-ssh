@@ -37,6 +37,14 @@ export type CommandResult = {
   stderr: string;
 };
 
+export type EgressTestResult = {
+  url: string;
+  ok: boolean;
+  status?: string | null;
+  elapsedMs?: number | null;
+  output: CommandResult;
+};
+
 export type ServiceCommandResult = {
   state: string;
   output: CommandResult;

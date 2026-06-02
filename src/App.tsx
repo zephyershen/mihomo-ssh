@@ -6,6 +6,7 @@ import {
   Download,
   FileText,
   Gauge,
+  Globe,
   ListRestart,
   Loader2,
   Network,
@@ -18,6 +19,7 @@ import {
   Settings,
   ShieldAlert,
   TerminalSquare,
+  Trash2,
   UploadCloud,
   Wifi,
   XCircle,
@@ -31,7 +33,15 @@ import {
   type AppUpdateProgress,
   type AppUpdateStatus,
 } from "./lib/updater";
-import type { CommandResult, OperationLog, ProxyGroup, ProxyNode, Server, ServerHealth } from "./types";
+import type {
+  CommandResult,
+  EgressTestResult,
+  OperationLog,
+  ProxyGroup,
+  ProxyNode,
+  Server,
+  ServerHealth,
+} from "./types";
 
 type Tab = "overview" | "install" | "subscription" | "nodes" | "config" | "logs" | "updates";
 
@@ -53,6 +63,8 @@ export function App() {
   const [busy, setBusy] = useState<string | null>(null);
   const [toast, setToast] = useState<string>("");
   const [commandOutput, setCommandOutput] = useState<string>("");
+  const [egressUrl, setEgressUrl] = useState("https://www.gstatic.com/generate_204");
+  const [egressResult, setEgressResult] = useState<EgressTestResult | null>(null);
   const [subscriptionUrl, setSubscriptionUrl] = useState("");
   const [groups, setGroups] = useState<ProxyGroup[]>([]);
   const [selectedGroup, setSelectedGroup] = useState<string>("");
@@ -73,7 +85,9 @@ export function App() {
   const loadServers = useCallback(async () => {
     const next = await api.listServers();
     setServers(next);
-    setSelectedId((current) => current ?? next[0]?.id ?? null);
+    setSelectedId((current) =>
+      current && next.some((server) => server.id === current) ? current : next[0]?.id ?? null,
+    );
   }, []);
 
   useEffect(() => {
@@ -84,6 +98,7 @@ export function App() {
     if (!selectedId) {
       return;
     }
+    setEgressResult(null);
     void refreshHealth(selectedId);
     void refreshOperationLogs(selectedId);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -149,6 +164,39 @@ export function App() {
       setServers(next);
       setSelectedId(next[0]?.id ?? null);
     });
+  }
+
+  async function deleteSelectedServer() {
+    if (!selected) return;
+    const confirmed = window.confirm(
+      `删除本地服务器条目 "${selected.displayName}"？这不会删除远端服务器或远端 mihomo。`,
+    );
+    if (!confirmed) return;
+
+    await run("删除服务器", () => api.deleteServer(selected.id), (next) => {
+      setServers(next);
+      setSelectedId(next[0]?.id ?? null);
+      setHealth(null);
+      setGroups([]);
+      setMeasuredNodes([]);
+      setLogs("");
+      setOperationLogs([]);
+      setCommandOutput("");
+      setEgressResult(null);
+    });
+  }
+
+  async function testEgress() {
+    if (!selected) return;
+    const result = await run(
+      "测试外网访问",
+      () => api.testServerEgress(selected.id, egressUrl),
+      (value) => setEgressResult(value),
+    );
+    if (result) {
+      setCommandOutput(redactForDisplay(result.output.ok ? result.output.stdout : result.output.stderr));
+      void refreshOperationLogs();
+    }
   }
 
   async function loadProxyGroups() {
@@ -273,6 +321,10 @@ export function App() {
               <RefreshCcw size={16} />
               Refresh
             </button>
+            <button className="tool-button danger-text" title="删除本地服务器条目" disabled={!selected || !!busy} onClick={deleteSelectedServer}>
+              <Trash2 size={16} />
+              Delete
+            </button>
           </div>
         </header>
 
@@ -301,6 +353,10 @@ export function App() {
               onStart={() => selected && command("启动代理", () => service(selected.id, "start"))}
               onStop={() => selected && command("关闭代理", () => service(selected.id, "stop"))}
               onRestart={() => selected && command("重启代理", () => service(selected.id, "restart"))}
+              egressUrl={egressUrl}
+              setEgressUrl={setEgressUrl}
+              egressResult={egressResult}
+              onTestEgress={testEgress}
             />
           )}
 
@@ -473,6 +529,10 @@ function OverviewPanel(props: {
   onStart: () => void;
   onStop: () => void;
   onRestart: () => void;
+  egressUrl: string;
+  setEgressUrl: (value: string) => void;
+  egressResult: EgressTestResult | null;
+  onTestEgress: () => void;
 }) {
   const { selected, health, busy, onStart, onStop, onRestart } = props;
   return (
@@ -508,6 +568,33 @@ function OverviewPanel(props: {
           <KeyValue label="Systemd" value={health?.hasSystemd ? "yes" : "no"} />
           <KeyValue label="Subscription" value={health?.hasSubscription ? "saved" : "missing"} />
         </div>
+      </div>
+
+      <div className="wide-panel">
+        <div className="panel-title">External Access</div>
+        <label className="field-label">
+          <span>Target URL</span>
+          <input
+            value={props.egressUrl}
+            placeholder="https://www.gstatic.com/generate_204"
+            onChange={(event) => props.setEgressUrl(event.target.value)}
+          />
+        </label>
+        <div className="button-row">
+          <button className="command-button" disabled={!selected || !!busy} onClick={props.onTestEgress}>
+            <Globe size={17} />
+            Test URL
+          </button>
+        </div>
+        {props.egressResult && (
+          <div className={`egress-result ${props.egressResult.ok ? "ok" : "error"}`} title={props.egressResult.url}>
+            <strong>{props.egressResult.ok ? "reachable" : "failed"}</strong>
+            <span>
+              {props.egressResult.status ?? "-"}
+              {props.egressResult.elapsedMs ? ` · ${props.egressResult.elapsedMs} ms` : ""}
+            </span>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -693,6 +780,8 @@ function ConfigPanel({ health, selected }: { health: ServerHealth | null; select
         <div className="kv-grid">
           <KeyValue label="Host" value={selected?.hostName} />
           <KeyValue label="User" value={selected?.user} />
+          <KeyValue label="Port" value={selected?.port} />
+          <KeyValue label="Identity" value={selected?.identityFileHint || "ssh config/default key"} />
           <KeyValue label="mixed-port" value={health?.mixedPort} />
           <KeyValue label="controller" value={health?.controller} />
           <KeyValue label="allow-lan" value={String(health?.allowLan ?? "unknown")} />

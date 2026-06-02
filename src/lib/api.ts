@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   CommandResult,
+  EgressTestResult,
   OperationLog,
   ProxyGroup,
   ProxyNode,
@@ -22,9 +23,12 @@ async function call<T>(command: string, args?: Record<string, unknown>): Promise
 export const api = {
   listServers: () => call<Server[]>("list_servers"),
   importSshHosts: () => call<Server[]>("import_ssh_hosts"),
+  deleteServer: (serverId: number) => call<Server[]>("delete_server", { serverId }),
   listOperationLogs: (serverId?: number, limit = 120) =>
     call<OperationLog[]>("list_operation_logs", { serverId, limit }),
   testConnection: (serverId: number) => call<CommandResult>("test_connection", { serverId }),
+  testServerEgress: (serverId: number, url: string) =>
+    call<EgressTestResult>("test_server_egress", { serverId, url }),
   inspectServer: (serverId: number) => call<ServerHealth>("inspect_server", { serverId }),
   installOrRepairMihomo: (serverId: number, subscriptionUrl?: string) =>
     call<CommandResult>("install_or_repair_mihomo", {
@@ -90,8 +94,18 @@ async function mockInvoke<T>(command: string, args?: Record<string, unknown>): P
     case "list_servers":
     case "import_ssh_hosts":
       return [sampleServer] as T;
+    case "delete_server":
+      return [] as T;
     case "inspect_server":
       return sampleHealth as T;
+    case "test_server_egress":
+      return {
+        url: String(args?.url ?? "https://www.gstatic.com/generate_204"),
+        ok: true,
+        status: "204",
+        elapsedMs: 128,
+        output: { ok: true, code: 0, stdout: "status=204\nelapsed=0.128\n", stderr: "" },
+      } as T;
     case "test_connection":
     case "install_or_repair_mihomo":
     case "update_subscription":

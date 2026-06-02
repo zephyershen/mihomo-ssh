@@ -68,6 +68,16 @@ pub struct CommandResult {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct EgressTestResult {
+    pub url: String,
+    pub ok: bool,
+    pub status: Option<String>,
+    pub elapsed_ms: Option<u64>,
+    pub output: CommandResult,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ServiceCommandResult {
     pub state: String,
     pub output: CommandResult,

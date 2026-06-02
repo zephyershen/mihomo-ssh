@@ -22,7 +22,10 @@ impl Storage {
     }
 
     fn connect(&self) -> Result<Connection, String> {
-        Connection::open(&self.db_path).map_err(|err| err.to_string())
+        let conn = Connection::open(&self.db_path).map_err(|err| err.to_string())?;
+        conn.execute_batch("PRAGMA foreign_keys = ON;")
+            .map_err(|err| err.to_string())?;
+        Ok(conn)
     }
 
     fn init(&self) -> Result<(), String> {
@@ -171,6 +174,17 @@ impl Storage {
         Ok(())
     }
 
+    pub fn delete_server(&self, server_id: i64) -> Result<Vec<Server>, String> {
+        let conn = self.connect()?;
+        let deleted = conn
+            .execute("DELETE FROM servers WHERE id = ?1", params![server_id])
+            .map_err(|err| err.to_string())?;
+        if deleted == 0 {
+            return Err(format!("server {server_id} not found"));
+        }
+        self.list_servers()
+    }
+
     pub fn add_log(
         &self,
         server_id: Option<i64>,
@@ -190,7 +204,11 @@ impl Storage {
         Ok(())
     }
 
-    pub fn list_logs(&self, server_id: Option<i64>, limit: u32) -> Result<Vec<OperationLog>, String> {
+    pub fn list_logs(
+        &self,
+        server_id: Option<i64>,
+        limit: u32,
+    ) -> Result<Vec<OperationLog>, String> {
         let conn = self.connect()?;
         let limit = i64::from(limit.clamp(1, 500));
 
