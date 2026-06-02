@@ -89,6 +89,18 @@ export function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedId]);
 
+  useEffect(() => {
+    if (!toast || busy) {
+      return;
+    }
+
+    const timeout = window.setTimeout(
+      () => setToast(""),
+      toast.includes("失败") ? 6500 : 3200,
+    );
+    return () => window.clearTimeout(timeout);
+  }, [busy, toast]);
+
   async function run<T>(
     label: string,
     work: () => Promise<T>,
@@ -144,7 +156,13 @@ export function App() {
     await run("加载节点", () => api.listProxyGroups(selected.id), (next) => {
       setGroups(next);
       setSelectedGroup((current) => current || next[0]?.name || "");
+      setMeasuredNodes([]);
     });
+  }
+
+  function changeSelectedGroup(group: string) {
+    setSelectedGroup(group);
+    setMeasuredNodes([]);
   }
 
   async function measureDelay() {
@@ -154,7 +172,9 @@ export function App() {
 
   async function selectNode(group: string, node: string) {
     if (!selected) return;
-    await run("切换节点", () => api.selectProxyNode(selected.id, group, node), setGroups);
+    await run("切换节点", () => api.selectProxyNode(selected.id, group, node), (next) => {
+      setGroups(next);
+    });
   }
 
   async function readLogs() {
@@ -190,6 +210,7 @@ export function App() {
 
   const currentGroup = groups.find((group) => group.name === selectedGroup);
   const displayedNodes = measuredNodes.length ? measuredNodes : currentGroup?.nodes ?? [];
+  const selectedNodeName = currentGroup?.now ?? null;
 
   return (
     <div className="app-shell">
@@ -319,8 +340,9 @@ export function App() {
               busy={busy}
               groups={groups}
               selectedGroup={selectedGroup}
-              setSelectedGroup={setSelectedGroup}
+              setSelectedGroup={changeSelectedGroup}
               nodes={displayedNodes}
+              selectedNodeName={selectedNodeName}
               onOpenTunnel={() => selected && run("打开控制通道", () => api.openControllerTunnel(selected.id))}
               onCloseTunnel={() => selected && run("关闭控制通道", () => api.closeControllerTunnel(selected.id))}
               onLoad={loadProxyGroups}
@@ -568,6 +590,7 @@ function NodesPanel(props: {
   selectedGroup: string;
   setSelectedGroup: (value: string) => void;
   nodes: ProxyNode[];
+  selectedNodeName: string | null;
   onOpenTunnel: () => void;
   onCloseTunnel: () => void;
   onLoad: () => void;
@@ -618,32 +641,36 @@ function NodesPanel(props: {
             </tr>
           </thead>
           <tbody>
-            {props.nodes.map((node) => (
-              <tr key={node.name}>
-                <td className="node-name">{node.name}</td>
-                <td>{node.nodeType ?? "-"}</td>
-                <td>{node.udp == null ? "-" : node.udp ? "yes" : "no"}</td>
-                <td>
-                  {node.alive === false ? (
-                    <span className="bad-text">fail</span>
-                  ) : node.delayMs ? (
-                    `${node.delayMs} ms`
-                  ) : (
-                    "-"
-                  )}
-                </td>
-                <td className="row-action">
-                  <button
-                    className="icon-button small"
-                    title="切换到此节点"
-                    disabled={!props.selectedGroup || !!props.busy}
-                    onClick={() => props.onSelect(props.selectedGroup, node.name)}
-                  >
-                    <CheckCircle2 size={15} />
-                  </button>
-                </td>
-              </tr>
-            ))}
+            {props.nodes.map((node) => {
+              const selected = node.name === props.selectedNodeName;
+              const delay = node.alive === false ? "fail" : node.delayMs ? `${node.delayMs} ms` : "-";
+              return (
+                <tr key={node.name} className={selected ? "selected-node-row" : ""}>
+                  <td className="node-name" title={node.name}>{node.name}</td>
+                  <td title={node.nodeType ?? "-"}>{node.nodeType ?? "-"}</td>
+                  <td>{node.udp == null ? "-" : node.udp ? "yes" : "no"}</td>
+                  <td title={delay}>
+                    {node.alive === false ? (
+                      <span className="bad-text">fail</span>
+                    ) : node.delayMs ? (
+                      `${node.delayMs} ms`
+                    ) : (
+                      "-"
+                    )}
+                  </td>
+                  <td className="row-action">
+                    <button
+                      className={`icon-button small ${selected ? "selected-node-button" : ""}`}
+                      title={selected ? "当前节点" : "切换到此节点"}
+                      disabled={!props.selectedGroup || !!props.busy || selected}
+                      onClick={() => props.onSelect(props.selectedGroup, node.name)}
+                    >
+                      <CheckCircle2 size={15} />
+                    </button>
+                  </td>
+                </tr>
+              );
+            })}
             {!props.nodes.length && (
               <tr>
                 <td colSpan={5} className="empty-table">

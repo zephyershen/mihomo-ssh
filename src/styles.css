@@ -581,6 +581,16 @@ td {
   font-size: 13px;
 }
 
+.selected-node-row td {
+  border-bottom-color: #bbf7d0;
+  background: #f0fdf4;
+}
+
+.selected-node-row .node-name {
+  color: #14532d;
+  font-weight: 700;
+}
+
 th:last-child,
 td:last-child {
   width: 60px;
@@ -592,6 +602,14 @@ td:last-child {
 
 .bad-text {
   color: #dc2626;
+}
+
+.selected-node-button,
+.selected-node-button:disabled {
+  border-color: rgba(22, 163, 74, 0.54);
+  color: #15803d;
+  background: #dcfce7;
+  opacity: 1;
 }
 
 .ops-list {

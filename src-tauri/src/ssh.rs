@@ -7,6 +7,9 @@ use std::{
     time::Duration,
 };
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
 use wait_timeout::ChildExt;
 
 use crate::{
@@ -150,7 +153,8 @@ pub fn spawn_tunnel(server: &Server, local_port: u16) -> Result<std::process::Ch
     args.push(format!("127.0.0.1:{local_port}:127.0.0.1:9090"));
     args.push(ssh_target(server));
 
-    Command::new(ssh_program())
+    let mut command = hidden_command(ssh_program());
+    command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -165,7 +169,8 @@ fn run_process(
     input: Option<&str>,
     timeout: Duration,
 ) -> Result<CommandResult, String> {
-    let mut child = Command::new(program)
+    let mut command = hidden_command(program);
+    let mut child = command
         .args(args)
         .stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
@@ -214,6 +219,21 @@ fn read_pipe<T: Read>(pipe: &mut Option<T>) -> Result<String, String> {
     }
     Ok(buffer)
 }
+
+fn hidden_command(program: &str) -> Command {
+    let mut command = Command::new(program);
+    hide_child_window(&mut command);
+    command
+}
+
+#[cfg(windows)]
+fn hide_child_window(command: &mut Command) {
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+    command.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(windows))]
+fn hide_child_window(_command: &mut Command) {}
 
 fn base_ssh_args() -> Vec<String> {
     vec![
