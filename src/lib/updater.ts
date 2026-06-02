@@ -103,9 +103,8 @@ export async function downloadInstallAndRelaunch(
 
 function normalizeUpdateError(error: unknown): string {
   const raw = error instanceof Error ? error.message : String(error);
-  if (/pubkey|endpoint|config|update/i.test(raw)) {
+  if (/pubkey|endpoint|config|update|plugin|not found/i.test(raw)) {
     return "当前安装包未启用更新源。请先安装由 GitHub Release 发布的版本。";
   }
   return raw;
 }
-

@@ -54,6 +54,14 @@ Required GitHub secrets for release updates:
 - `TAURI_SIGNING_PRIVATE_KEY`
 - `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` if the private key is password protected
 
+Generate the updater key pair locally:
+
+```bash
+npm run tauri -- signer generate -w ~/.tauri/mihomo-server-manager.key
+```
+
+Use the printed public key as `TAURI_UPDATER_PUBLIC_KEY`. Use the private key file contents as `TAURI_SIGNING_PRIVATE_KEY`. Keep the private key backed up and never commit it.
+
 The first updater-enabled release still has to be installed manually. Later release builds can be installed from inside the app through the Update tab.
 
 ## First-version assumptions

@@ -224,9 +224,13 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .setup(|app| {
             #[cfg(desktop)]
-            app.handle()
-                .plugin(tauri_plugin_updater::Builder::new().build())
-                .map_err(Box::<dyn std::error::Error>::from)?;
+            {
+                if option_env!("MIHOMO_ENABLE_UPDATER").is_some() {
+                    app.handle()
+                        .plugin(tauri_plugin_updater::Builder::new().build())
+                        .map_err(Box::<dyn std::error::Error>::from)?;
+                }
+            }
 
             let app_dir = app
                 .path()
