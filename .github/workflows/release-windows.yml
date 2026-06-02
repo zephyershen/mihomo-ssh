@@ -102,10 +102,7 @@ jobs:
           releaseCommitish: ${{ github.sha }}
           releaseDraft: false
           prerelease: false
-          tauriScript: npm run tauri --
+          tauriScript: npm run tauri
           args: --bundles nsis --config src-tauri/tauri.release.conf.json
           updaterJsonPreferNsis: true
-          uploadUpdaterJson: true
-          uploadUpdaterSignatures: true
-          uploadWorkflowArtifacts: true
-          workflowArtifactNamePattern: mihomo-server-manager-[platform]-[arch]-[bundle]
+          includeUpdaterJson: true
