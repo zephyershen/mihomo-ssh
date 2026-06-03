@@ -3,13 +3,16 @@ import {
   Cable,
   CheckCircle2,
   CircleDot,
+  Clipboard,
   Download,
   FileText,
   Gauge,
   Globe,
+  KeyRound,
   ListRestart,
   Loader2,
   Network,
+  Plus,
   Power,
   PowerOff,
   RefreshCcw,
@@ -36,14 +39,24 @@ import {
 import type {
   CommandResult,
   EgressTestResult,
+  ManagedSshKeyInfo,
+  ManualServerInput,
   OperationLog,
   ProxyGroup,
   ProxyNode,
   Server,
+  ServerBootstrapInput,
   ServerHealth,
 } from "./types";
 
 type Tab = "overview" | "install" | "subscription" | "nodes" | "config" | "logs" | "updates";
+type ServerDraft = {
+  displayName: string;
+  hostName: string;
+  user: string;
+  port: string;
+  password: string;
+};
 
 const tabs: Array<{ id: Tab; label: string; icon: typeof Activity }> = [
   { id: "overview", label: "概览", icon: Gauge },
@@ -58,6 +71,15 @@ const tabs: Array<{ id: Tab; label: string; icon: typeof Activity }> = [
 export function App() {
   const [servers, setServers] = useState<Server[]>([]);
   const [selectedId, setSelectedId] = useState<number | null>(null);
+  const [showAddServer, setShowAddServer] = useState(false);
+  const [serverDraft, setServerDraft] = useState<ServerDraft>({
+    displayName: "",
+    hostName: "",
+    user: "root",
+    port: "22",
+    password: "",
+  });
+  const [managedKey, setManagedKey] = useState<ManagedSshKeyInfo | null>(null);
   const [health, setHealth] = useState<ServerHealth | null>(null);
   const [activeTab, setActiveTab] = useState<Tab>("overview");
   const [busy, setBusy] = useState<string | null>(null);
@@ -166,6 +188,75 @@ export function App() {
     });
   }
 
+  async function toggleAddServer() {
+    setShowAddServer((current) => !current);
+    if (!managedKey) {
+      await run("准备 SSH key", api.getManagedSshKey, setManagedKey);
+    }
+  }
+
+  function updateServerDraft(field: keyof ServerDraft, value: string) {
+    setServerDraft((current) => ({ ...current, [field]: value }));
+  }
+
+  function manualServerInput(): ManualServerInput {
+    return {
+      displayName: serverDraft.displayName || null,
+      hostName: serverDraft.hostName,
+      user: serverDraft.user,
+      port: Number(serverDraft.port) || 22,
+    };
+  }
+
+  function selectAddedServer(next: Server[], input: ManualServerInput) {
+    const port = input.port || 22;
+    const match = next.find(
+      (server) =>
+        server.source === "manual" &&
+        server.hostName === input.hostName.trim() &&
+        server.user === input.user.trim() &&
+        (server.port || 22) === port,
+    );
+    setSelectedId(match?.id ?? next[0]?.id ?? null);
+    setHealth(null);
+    setGroups([]);
+    setMeasuredNodes([]);
+    setCommandOutput("");
+    setEgressResult(null);
+  }
+
+  async function addManualServer() {
+    const input = manualServerInput();
+    await run("添加服务器", () => api.addManualServer(input), (next) => {
+      setServers(next);
+      selectAddedServer(next, input);
+      setShowAddServer(false);
+      setServerDraft((current) => ({ ...current, password: "" }));
+    });
+  }
+
+  async function bootstrapServer() {
+    const input: ServerBootstrapInput = {
+      ...manualServerInput(),
+      password: serverDraft.password,
+    };
+    await run("初始化 SSH key", () => api.bootstrapServerWithPassword(input), (next) => {
+      setServers(next);
+      selectAddedServer(next, input);
+      setShowAddServer(false);
+      setServerDraft((current) => ({ ...current, password: "" }));
+    });
+  }
+
+  async function copyManagedPublicKey() {
+    await run("复制公钥", async () => {
+      const key = managedKey ?? (await api.getManagedSshKey());
+      setManagedKey(key);
+      await navigator.clipboard.writeText(key.publicKey);
+      return key;
+    });
+  }
+
   async function deleteSelectedServer() {
     if (!selected) return;
     const confirmed = window.confirm(
@@ -216,6 +307,35 @@ export function App() {
   async function measureDelay() {
     if (!selected || !selectedGroup) return;
     await run("测速", () => api.measureProxyDelay(selected.id, selectedGroup), setMeasuredNodes);
+  }
+
+  function mergeNodeResult(nodes: ProxyNode[], result: ProxyNode): ProxyNode[] {
+    if (!nodes.length) return [result];
+    return nodes.map((node) =>
+      node.name === result.name
+        ? {
+            ...node,
+            delayMs: result.delayMs,
+            alive: result.alive,
+            nodeType: node.nodeType ?? result.nodeType,
+            udp: node.udp ?? result.udp,
+          }
+        : node,
+    );
+  }
+
+  async function testSingleNode(node: string) {
+    if (!selected) return;
+    await run("测试节点", () => api.measureProxyNodeDelay(selected.id, node), (result) => {
+      setGroups((current) =>
+        current.map((group) =>
+          group.name === selectedGroup ? { ...group, nodes: mergeNodeResult(group.nodes, result) } : group,
+        ),
+      );
+      setMeasuredNodes((current) =>
+        mergeNodeResult(current.length ? current : currentGroup?.nodes ?? [], result),
+      );
+    });
   }
 
   async function selectNode(group: string, node: string) {
@@ -274,6 +394,9 @@ export function App() {
         </div>
 
         <div className="sidebar-actions">
+          <button className="icon-button" title="添加服务器" onClick={toggleAddServer} disabled={!!busy}>
+            <Plus size={17} />
+          </button>
           <button className="icon-button" title="导入 SSH config" onClick={importHosts} disabled={!!busy}>
             <UploadCloud size={17} />
           </button>
@@ -281,6 +404,18 @@ export function App() {
             <RefreshCcw size={17} />
           </button>
         </div>
+
+        {showAddServer && (
+          <AddServerPanel
+            draft={serverDraft}
+            keyInfo={managedKey}
+            busy={busy}
+            onChange={updateServerDraft}
+            onAdd={addManualServer}
+            onBootstrap={bootstrapServer}
+            onCopyKey={copyManagedPublicKey}
+          />
+        )}
 
         <div className="server-list">
           {servers.map((server) => (
@@ -403,6 +538,7 @@ export function App() {
               onCloseTunnel={() => selected && run("关闭控制通道", () => api.closeControllerTunnel(selected.id))}
               onLoad={loadProxyGroups}
               onMeasure={measureDelay}
+              onTestNode={testSingleNode}
               onSelect={selectNode}
             />
           )}
@@ -438,6 +574,91 @@ export function App() {
           </div>
         )}
       </main>
+    </div>
+  );
+}
+
+function AddServerPanel(props: {
+  draft: ServerDraft;
+  keyInfo: ManagedSshKeyInfo | null;
+  busy: string | null;
+  onChange: (field: keyof ServerDraft, value: string) => void;
+  onAdd: () => void;
+  onBootstrap: () => void;
+  onCopyKey: () => void;
+}) {
+  return (
+    <div className="add-server-panel">
+      <label className="field-label">
+        <span>Name</span>
+        <input
+          value={props.draft.displayName}
+          placeholder="codex-box"
+          onChange={(event) => props.onChange("displayName", event.target.value)}
+        />
+      </label>
+      <label className="field-label">
+        <span>Host / IP</span>
+        <input
+          value={props.draft.hostName}
+          placeholder="10.40.2.39"
+          onChange={(event) => props.onChange("hostName", event.target.value)}
+        />
+      </label>
+      <div className="field-grid">
+        <label className="field-label">
+          <span>User</span>
+          <input
+            value={props.draft.user}
+            placeholder="root"
+            onChange={(event) => props.onChange("user", event.target.value)}
+          />
+        </label>
+        <label className="field-label">
+          <span>Port</span>
+          <input
+            value={props.draft.port}
+            inputMode="numeric"
+            placeholder="22"
+            onChange={(event) => props.onChange("port", event.target.value)}
+          />
+        </label>
+      </div>
+      <label className="field-label">
+        <span>Password</span>
+        <input
+          type="password"
+          value={props.draft.password}
+          autoComplete="off"
+          placeholder="one-time"
+          onChange={(event) => props.onChange("password", event.target.value)}
+        />
+      </label>
+      <div className="key-chip" title={props.keyInfo?.privateKeyHint ?? "managed SSH key"}>
+        <KeyRound size={14} />
+        <span>{props.keyInfo?.privateKeyHint ?? "managed key"}</span>
+      </div>
+      <div className="button-row">
+        <button
+          className="command-button primary compact-button"
+          disabled={!!props.busy || !props.draft.hostName || !props.draft.user || !props.draft.password}
+          onClick={props.onBootstrap}
+        >
+          <KeyRound size={15} />
+          Bootstrap
+        </button>
+        <button
+          className="command-button compact-button"
+          disabled={!!props.busy || !props.draft.hostName || !props.draft.user}
+          onClick={props.onAdd}
+        >
+          <Plus size={15} />
+          Add
+        </button>
+        <button className="icon-button" title="复制 app 公钥" disabled={!!props.busy} onClick={props.onCopyKey}>
+          <Clipboard size={15} />
+        </button>
+      </div>
     </div>
   );
 }
@@ -682,6 +903,7 @@ function NodesPanel(props: {
   onCloseTunnel: () => void;
   onLoad: () => void;
   onMeasure: () => void;
+  onTestNode: (node: string) => void;
   onSelect: (group: string, node: string) => void;
 }) {
   return (
@@ -746,6 +968,14 @@ function NodesPanel(props: {
                     )}
                   </td>
                   <td className="row-action">
+                    <button
+                      className="icon-button small"
+                      title="测试此节点"
+                      disabled={!!props.busy}
+                      onClick={() => props.onTestNode(node.name)}
+                    >
+                      <Activity size={15} />
+                    </button>
                     <button
                       className={`icon-button small ${selected ? "selected-node-button" : ""}`}
                       title={selected ? "当前节点" : "切换到此节点"}

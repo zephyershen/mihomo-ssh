@@ -1,10 +1,4 @@
-use std::{
-    collections::HashMap,
-    net::TcpListener,
-    process::Child,
-    sync::Mutex,
-    time::Duration,
-};
+use std::{collections::HashMap, net::TcpListener, process::Child, sync::Mutex, time::Duration};
 
 use serde_json::{json, Value};
 use tokio::time::sleep;
@@ -98,7 +92,12 @@ impl TunnelRegistry {
             .map_err(|_| "tunnel registry lock poisoned".to_string())?;
         let mut dead = Vec::new();
         for (server_id, process) in children.iter_mut() {
-            if process.child.try_wait().map_err(|err| err.to_string())?.is_some() {
+            if process
+                .child
+                .try_wait()
+                .map_err(|err| err.to_string())?
+                .is_some()
+            {
                 dead.push(*server_id);
             }
         }
@@ -152,9 +151,8 @@ pub async fn measure_proxy_delay(port: u16, group: &str) -> Result<Vec<ProxyNode
 
     for mut node in target.nodes {
         let encoded = urlencoding::encode(&node.name);
-        let url = format!(
-            "http://127.0.0.1:{port}/proxies/{encoded}/delay?timeout=5000&url={test_url}"
-        );
+        let url =
+            format!("http://127.0.0.1:{port}/proxies/{encoded}/delay?timeout=5000&url={test_url}");
         match client.get(url).send().await {
             Ok(response) if response.status().is_success() => {
                 let value: Value = response.json().await.unwrap_or(Value::Null);
@@ -170,6 +168,43 @@ pub async fn measure_proxy_delay(port: u16, group: &str) -> Result<Vec<ProxyNode
     }
 
     Ok(measured)
+}
+
+pub async fn measure_proxy_node_delay(port: u16, node: &str) -> Result<ProxyNode, String> {
+    wait_for_controller(port).await?;
+    let client = reqwest::Client::new();
+    let encoded = urlencoding::encode(node);
+    let test_url = urlencoding::encode("https://www.gstatic.com/generate_204");
+    let url =
+        format!("http://127.0.0.1:{port}/proxies/{encoded}/delay?timeout=5000&url={test_url}");
+
+    match client.get(url).send().await {
+        Ok(response) if response.status().is_success() => {
+            let value: Value = response.json().await.unwrap_or(Value::Null);
+            let delay_ms = value.get("delay").and_then(Value::as_u64);
+            Ok(ProxyNode {
+                name: node.to_string(),
+                node_type: None,
+                udp: None,
+                delay_ms,
+                alive: Some(delay_ms.is_some()),
+            })
+        }
+        Ok(response) => Ok(ProxyNode {
+            name: node.to_string(),
+            node_type: None,
+            udp: None,
+            delay_ms: None,
+            alive: Some(response.status().is_success()),
+        }),
+        Err(_) => Ok(ProxyNode {
+            name: node.to_string(),
+            node_type: None,
+            udp: None,
+            delay_ms: None,
+            alive: Some(false),
+        }),
+    }
 }
 
 pub fn parse_proxy_groups(data: &Value) -> Result<Vec<ProxyGroup>, String> {
@@ -194,7 +229,9 @@ pub fn parse_proxy_groups(data: &Value) -> Result<Vec<ProxyGroup>, String> {
                         .and_then(|value| value.get("type"))
                         .and_then(Value::as_str)
                         .map(ToString::to_string),
-                    udp: detail.and_then(|value| value.get("udp")).and_then(Value::as_bool),
+                    udp: detail
+                        .and_then(|value| value.get("udp"))
+                        .and_then(Value::as_bool),
                     delay_ms: detail
                         .and_then(|value| value.get("history"))
                         .and_then(Value::as_array)
@@ -216,7 +253,11 @@ pub fn parse_proxy_groups(data: &Value) -> Result<Vec<ProxyGroup>, String> {
         });
     }
 
-    groups.sort_by(|a, b| a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase()));
+    groups.sort_by(|a, b| {
+        a.name
+            .to_ascii_lowercase()
+            .cmp(&b.name.to_ascii_lowercase())
+    });
     Ok(groups)
 }
 

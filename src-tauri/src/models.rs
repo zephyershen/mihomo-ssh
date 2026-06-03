@@ -10,6 +10,8 @@ pub struct Server {
     pub user: Option<String>,
     pub port: Option<u16>,
     pub identity_file_hint: Option<String>,
+    #[serde(skip_serializing, skip_deserializing)]
+    pub identity_file_path: Option<String>,
     pub source: String,
     pub last_status: Option<String>,
     pub last_seen_at: Option<String>,
@@ -23,6 +25,33 @@ pub struct ImportedHost {
     pub user: Option<String>,
     pub port: Option<u16>,
     pub identity_file_hint: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManualServerInput {
+    pub display_name: Option<String>,
+    pub host_name: String,
+    pub user: String,
+    pub port: Option<u16>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerBootstrapInput {
+    pub display_name: Option<String>,
+    pub host_name: String,
+    pub user: String,
+    pub port: Option<u16>,
+    pub password: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManagedSshKeyInfo {
+    pub public_key: String,
+    pub public_key_hint: String,
+    pub private_key_hint: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

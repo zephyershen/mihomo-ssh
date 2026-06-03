@@ -102,6 +102,44 @@ button:disabled {
   border-bottom: 1px solid var(--line);
 }
 
+.add-server-panel {
+  display: grid;
+  gap: 10px;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--line);
+  background: #f8fbff;
+}
+
+.add-server-panel .field-label {
+  margin-bottom: 0;
+}
+
+.field-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 76px;
+  gap: 8px;
+}
+
+.key-chip {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  gap: 7px;
+  min-height: 32px;
+  padding: 0 9px;
+  border: 1px solid #d8e2ef;
+  border-radius: 8px;
+  color: #334155;
+  background: #ffffff;
+  font-size: 12px;
+}
+
+.key-chip span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .server-list {
   overflow: auto;
   padding: 8px;
@@ -258,6 +296,11 @@ h1 {
   border-color: #1d4ed8;
   color: #ffffff;
   background: #2563eb;
+}
+
+.compact-button {
+  min-width: 0;
+  padding: 0 9px;
 }
 
 .command-button.danger {
@@ -646,11 +689,13 @@ td {
 
 th:last-child,
 td:last-child {
-  width: 60px;
+  width: 78px;
 }
 
 .row-action {
-  text-align: right;
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
 }
 
 .bad-text {

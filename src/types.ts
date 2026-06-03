@@ -11,6 +11,23 @@ export type Server = {
   lastSeenAt?: string | null;
 };
 
+export type ManualServerInput = {
+  displayName?: string | null;
+  hostName: string;
+  user: string;
+  port?: number | null;
+};
+
+export type ServerBootstrapInput = ManualServerInput & {
+  password: string;
+};
+
+export type ManagedSshKeyInfo = {
+  publicKey: string;
+  publicKeyHint: string;
+  privateKeyHint: string;
+};
+
 export type ServerHealth = {
   osPrettyName?: string | null;
   osId?: string | null;

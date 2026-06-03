@@ -2,10 +2,13 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   CommandResult,
   EgressTestResult,
+  ManagedSshKeyInfo,
+  ManualServerInput,
   OperationLog,
   ProxyGroup,
   ProxyNode,
   Server,
+  ServerBootstrapInput,
   ServerHealth,
   ServiceCommandResult,
   TunnelInfo,
@@ -23,6 +26,10 @@ async function call<T>(command: string, args?: Record<string, unknown>): Promise
 export const api = {
   listServers: () => call<Server[]>("list_servers"),
   importSshHosts: () => call<Server[]>("import_ssh_hosts"),
+  getManagedSshKey: () => call<ManagedSshKeyInfo>("get_managed_ssh_key"),
+  addManualServer: (input: ManualServerInput) => call<Server[]>("add_manual_server", { input }),
+  bootstrapServerWithPassword: (input: ServerBootstrapInput) =>
+    call<Server[]>("bootstrap_server_with_password", { input }),
   deleteServer: (serverId: number) => call<Server[]>("delete_server", { serverId }),
   listOperationLogs: (serverId?: number, limit = 120) =>
     call<OperationLog[]>("list_operation_logs", { serverId, limit }),
@@ -51,6 +58,8 @@ export const api = {
     call<ProxyGroup[]>("select_proxy_node", { serverId, group, node }),
   measureProxyDelay: (serverId: number, group: string) =>
     call<ProxyNode[]>("measure_proxy_delay", { serverId, group }),
+  measureProxyNodeDelay: (serverId: number, node: string) =>
+    call<ProxyNode>("measure_proxy_node_delay", { serverId, node }),
   readMihomoLogs: (serverId: number, lines = 200) =>
     call<string>("read_mihomo_logs", { serverId, lines }),
   readMihomoConfig: (serverId: number) => call<string>("read_mihomo_config", { serverId }),
@@ -69,6 +78,18 @@ async function mockInvoke<T>(command: string, args?: Record<string, unknown>): P
     source: "ssh_config",
     lastStatus: "online",
     lastSeenAt: new Date().toISOString(),
+  };
+  const manualServer: Server = {
+    id: 2,
+    alias: "manual:root@10.0.0.22:22",
+    displayName: "manual-box",
+    hostName: "10.0.0.22",
+    user: "root",
+    port: 22,
+    identityFileHint: ".../mihomo_manager_ed25519",
+    source: "manual",
+    lastStatus: "unknown",
+    lastSeenAt: null,
   };
   const sampleHealth: ServerHealth = {
     osPrettyName: "Ubuntu 24.04 LTS",
@@ -94,6 +115,15 @@ async function mockInvoke<T>(command: string, args?: Record<string, unknown>): P
     case "list_servers":
     case "import_ssh_hosts":
       return [sampleServer] as T;
+    case "get_managed_ssh_key":
+      return {
+        publicKey: "ssh-ed25519 AAAAMOCK mihomo-server-manager",
+        publicKeyHint: ".../mihomo_manager_ed25519.pub",
+        privateKeyHint: ".../mihomo_manager_ed25519",
+      } as T;
+    case "add_manual_server":
+    case "bootstrap_server_with_password":
+      return [sampleServer, manualServer] as T;
     case "delete_server":
       return [] as T;
     case "inspect_server":
@@ -133,6 +163,14 @@ async function mockInvoke<T>(command: string, args?: Record<string, unknown>): P
         { name: "HK-01", nodeType: "ss", udp: true, delayMs: 92, alive: true },
         { name: "JP-02", nodeType: "trojan", udp: true, delayMs: 134, alive: true },
       ] as T;
+    case "measure_proxy_node_delay":
+      return {
+        name: String(args?.node ?? "HK-01"),
+        nodeType: null,
+        udp: null,
+        delayMs: Math.round(80 + Math.random() * 220),
+        alive: true,
+      } as T;
     case "read_mihomo_logs":
       return "mihomo mock log line\nservice active\n" as T;
     case "read_mihomo_config":

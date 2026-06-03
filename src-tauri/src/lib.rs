@@ -5,11 +5,12 @@ mod redaction;
 mod ssh;
 mod storage;
 
-use std::time::Duration;
+use std::{path::PathBuf, time::Duration};
 
 use models::{
-    CommandResult, EgressTestResult, InstallOptions, OperationLog, ProxyGroup, ProxyNode, Server,
-    ServerHealth, ServiceCommandResult, SubscriptionUpdateOptions, TunnelInfo,
+    CommandResult, EgressTestResult, InstallOptions, ManagedSshKeyInfo, ManualServerInput,
+    OperationLog, ProxyGroup, ProxyNode, Server, ServerBootstrapInput, ServerHealth,
+    ServiceCommandResult, SubscriptionUpdateOptions, TunnelInfo,
 };
 use reqwest::Url;
 use storage::Storage;
@@ -18,6 +19,7 @@ use tauri::{Manager, State};
 pub struct AppState {
     storage: Storage,
     tunnels: controller::TunnelRegistry,
+    app_dir: PathBuf,
 }
 
 #[tauri::command]
@@ -34,6 +36,80 @@ fn import_ssh_hosts(state: State<'_, AppState>) -> Result<Vec<Server>, String> {
         "import_ssh_hosts",
         "ok",
         &format!("imported {} SSH hosts", hosts.len()),
+    )?;
+    Ok(servers)
+}
+
+#[tauri::command]
+fn get_managed_ssh_key(state: State<'_, AppState>) -> Result<ManagedSshKeyInfo, String> {
+    ssh::ensure_managed_key(&state.app_dir)
+}
+
+#[tauri::command]
+fn add_manual_server(
+    state: State<'_, AppState>,
+    input: ManualServerInput,
+) -> Result<Vec<Server>, String> {
+    let input = normalize_manual_server_input(input)?;
+    let key = ssh::ensure_managed_key(&state.app_dir)?;
+    let private_key = ssh::managed_private_key_path(&state.app_dir);
+    let servers =
+        state
+            .storage
+            .upsert_manual_server(&input, &private_key, &key.private_key_hint)?;
+    state.storage.add_log(
+        None,
+        "add_manual_server",
+        "ok",
+        &format!(
+            "added {}@{}:{}",
+            input.user,
+            input.host_name,
+            input.port.unwrap_or(22)
+        ),
+    )?;
+    Ok(servers)
+}
+
+#[tauri::command]
+fn bootstrap_server_with_password(
+    state: State<'_, AppState>,
+    input: ServerBootstrapInput,
+) -> Result<Vec<Server>, String> {
+    let input = normalize_bootstrap_input(input)?;
+    let key = ssh::ensure_managed_key(&state.app_dir)?;
+    let result = ssh::bootstrap_authorized_key(&input, &key.public_key, Duration::from_secs(25))?;
+    if !result.ok {
+        state.storage.add_log(
+            None,
+            "bootstrap_server_with_password",
+            "error",
+            command_summary(&result).as_str(),
+        )?;
+        return Err(command_summary(&result));
+    }
+
+    let manual_input = ManualServerInput {
+        display_name: input.display_name,
+        host_name: input.host_name,
+        user: input.user,
+        port: input.port,
+    };
+    let private_key = ssh::managed_private_key_path(&state.app_dir);
+    let servers =
+        state
+            .storage
+            .upsert_manual_server(&manual_input, &private_key, &key.private_key_hint)?;
+    state.storage.add_log(
+        None,
+        "bootstrap_server_with_password",
+        "ok",
+        &format!(
+            "installed managed key on {}@{}:{}",
+            manual_input.user,
+            manual_input.host_name,
+            manual_input.port.unwrap_or(22)
+        ),
     )?;
     Ok(servers)
 }
@@ -267,6 +343,16 @@ async fn measure_proxy_delay(
 }
 
 #[tauri::command]
+async fn measure_proxy_node_delay(
+    state: State<'_, AppState>,
+    server_id: i64,
+    node: String,
+) -> Result<ProxyNode, String> {
+    let port = ensure_tunnel(&state, server_id)?;
+    controller::measure_proxy_node_delay(port, &node).await
+}
+
+#[tauri::command]
 fn read_mihomo_logs(
     state: State<'_, AppState>,
     server_id: i64,
@@ -379,6 +465,53 @@ fn parse_elapsed_ms(value: &str) -> Option<u64> {
     Some((seconds * 1000.0).round() as u64)
 }
 
+fn normalize_manual_server_input(
+    mut input: ManualServerInput,
+) -> Result<ManualServerInput, String> {
+    input.host_name = input.host_name.trim().to_string();
+    input.user = input.user.trim().to_string();
+    input.display_name = input
+        .display_name
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    input.port = Some(input.port.unwrap_or(22));
+    validate_server_fields(&input.host_name, &input.user, input.port.unwrap_or(22))?;
+    Ok(input)
+}
+
+fn normalize_bootstrap_input(
+    mut input: ServerBootstrapInput,
+) -> Result<ServerBootstrapInput, String> {
+    input.host_name = input.host_name.trim().to_string();
+    input.user = input.user.trim().to_string();
+    input.display_name = input
+        .display_name
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    input.port = Some(input.port.unwrap_or(22));
+    validate_server_fields(&input.host_name, &input.user, input.port.unwrap_or(22))?;
+    if input.password.is_empty() {
+        return Err("password is required for bootstrap".to_string());
+    }
+    Ok(input)
+}
+
+fn validate_server_fields(host_name: &str, user: &str, port: u16) -> Result<(), String> {
+    if host_name.is_empty() {
+        return Err("host is required".to_string());
+    }
+    if user.is_empty() {
+        return Err("user is required".to_string());
+    }
+    if host_name.chars().any(char::is_whitespace) || user.chars().any(char::is_whitespace) {
+        return Err("host and user cannot contain spaces".to_string());
+    }
+    if port == 0 {
+        return Err("port must be greater than 0".to_string());
+    }
+    Ok(())
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_process::init())
@@ -398,7 +531,7 @@ pub fn run() {
                     err.to_string(),
                 ))
             })?;
-            let storage = Storage::new(app_dir).map_err(|err| {
+            let storage = Storage::new(&app_dir).map_err(|err| {
                 Box::<dyn std::error::Error>::from(std::io::Error::new(
                     std::io::ErrorKind::Other,
                     err,
@@ -407,12 +540,16 @@ pub fn run() {
             app.manage(AppState {
                 storage,
                 tunnels: controller::TunnelRegistry::default(),
+                app_dir,
             });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             list_servers,
             import_ssh_hosts,
+            get_managed_ssh_key,
+            add_manual_server,
+            bootstrap_server_with_password,
             delete_server,
             list_operation_logs,
             test_connection,
@@ -426,6 +563,7 @@ pub fn run() {
             list_proxy_groups,
             select_proxy_node,
             measure_proxy_delay,
+            measure_proxy_node_delay,
             read_mihomo_logs,
             read_mihomo_config
         ])

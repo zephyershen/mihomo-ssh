@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension};
 
-use crate::models::{ImportedHost, OperationLog, Server};
+use crate::models::{ImportedHost, ManualServerInput, OperationLog, Server};
 
 #[derive(Debug, Clone)]
 pub struct Storage {
@@ -41,6 +41,7 @@ impl Storage {
               user TEXT,
               port INTEGER,
               identity_file_hint TEXT,
+              identity_file_path TEXT,
               source TEXT NOT NULL,
               last_status TEXT,
               last_seen_at TEXT,
@@ -60,6 +61,7 @@ impl Storage {
             "#,
         )
         .map_err(|err| err.to_string())?;
+        add_column_if_missing(&conn, "servers", "identity_file_path", "TEXT")?;
         Ok(())
     }
 
@@ -68,7 +70,7 @@ impl Storage {
         let mut stmt = conn
             .prepare(
                 r#"
-                SELECT id, alias, display_name, host_name, user, port, identity_file_hint,
+                SELECT id, alias, display_name, host_name, user, port, identity_file_hint, identity_file_path,
                        source, last_status, last_seen_at
                 FROM servers
                 ORDER BY display_name COLLATE NOCASE, alias COLLATE NOCASE
@@ -86,9 +88,10 @@ impl Storage {
                     user: row.get(4)?,
                     port: row.get::<_, Option<i64>>(5)?.map(|p| p as u16),
                     identity_file_hint: row.get(6)?,
-                    source: row.get(7)?,
-                    last_status: row.get(8)?,
-                    last_seen_at: row.get(9)?,
+                    identity_file_path: row.get(7)?,
+                    source: row.get(8)?,
+                    last_status: row.get(9)?,
+                    last_seen_at: row.get(10)?,
                 })
             })
             .map_err(|err| err.to_string())?;
@@ -101,7 +104,7 @@ impl Storage {
         let conn = self.connect()?;
         conn.query_row(
             r#"
-            SELECT id, alias, display_name, host_name, user, port, identity_file_hint,
+            SELECT id, alias, display_name, host_name, user, port, identity_file_hint, identity_file_path,
                    source, last_status, last_seen_at
             FROM servers
             WHERE id = ?1
@@ -116,9 +119,10 @@ impl Storage {
                     user: row.get(4)?,
                     port: row.get::<_, Option<i64>>(5)?.map(|p| p as u16),
                     identity_file_hint: row.get(6)?,
-                    source: row.get(7)?,
-                    last_status: row.get(8)?,
-                    last_seen_at: row.get(9)?,
+                    identity_file_path: row.get(7)?,
+                    source: row.get(8)?,
+                    last_status: row.get(9)?,
+                    last_seen_at: row.get(10)?,
                 })
             },
         )
@@ -136,14 +140,15 @@ impl Storage {
             tx.execute(
                 r#"
                 INSERT INTO servers
-                  (alias, display_name, host_name, user, port, identity_file_hint,
+                  (alias, display_name, host_name, user, port, identity_file_hint, identity_file_path,
                    source, created_at, updated_at)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'ssh_config', ?7, ?7)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, 'ssh_config', ?7, ?7)
                 ON CONFLICT(alias) DO UPDATE SET
                   host_name = excluded.host_name,
                   user = excluded.user,
                   port = excluded.port,
                   identity_file_hint = excluded.identity_file_hint,
+                  identity_file_path = excluded.identity_file_path,
                   source = excluded.source,
                   updated_at = excluded.updated_at
                 "#,
@@ -161,6 +166,54 @@ impl Storage {
         }
 
         tx.commit().map_err(|err| err.to_string())?;
+        self.list_servers()
+    }
+
+    pub fn upsert_manual_server(
+        &self,
+        input: &ManualServerInput,
+        identity_file_path: &Path,
+        identity_file_hint: &str,
+    ) -> Result<Vec<Server>, String> {
+        let conn = self.connect()?;
+        let now = Utc::now().to_rfc3339();
+        let port = input.port.unwrap_or(22);
+        let alias = manual_alias(&input.user, &input.host_name, port);
+        let display_name = input
+            .display_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(&input.host_name);
+
+        conn.execute(
+            r#"
+            INSERT INTO servers
+              (alias, display_name, host_name, user, port, identity_file_hint, identity_file_path,
+               source, created_at, updated_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'manual', ?8, ?8)
+            ON CONFLICT(alias) DO UPDATE SET
+              display_name = excluded.display_name,
+              host_name = excluded.host_name,
+              user = excluded.user,
+              port = excluded.port,
+              identity_file_hint = excluded.identity_file_hint,
+              identity_file_path = excluded.identity_file_path,
+              source = excluded.source,
+              updated_at = excluded.updated_at
+            "#,
+            params![
+                alias,
+                display_name,
+                input.host_name,
+                input.user,
+                i64::from(port),
+                identity_file_hint,
+                identity_file_path.to_string_lossy().to_string(),
+                now
+            ],
+        )
+        .map_err(|err| err.to_string())?;
         self.list_servers()
     }
 
@@ -247,6 +300,35 @@ impl Storage {
                 .map_err(|err| err.to_string())
         }
     }
+}
+
+fn add_column_if_missing(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    column_type: &str,
+) -> Result<(), String> {
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(|err| err.to_string())?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|err| err.to_string())?;
+    let columns = rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| err.to_string())?;
+    if !columns.iter().any(|name| name == column) {
+        conn.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {column_type}"),
+            [],
+        )
+        .map_err(|err| err.to_string())?;
+    }
+    Ok(())
+}
+
+fn manual_alias(user: &str, host_name: &str, port: u16) -> String {
+    format!("manual:{}@{}:{}", user.trim(), host_name.trim(), port)
 }
 
 fn log_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<OperationLog> {
