@@ -147,23 +147,63 @@ button:disabled {
 
 .server-row {
   display: grid;
-  grid-template-columns: 12px minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr) 32px;
   align-items: center;
   width: 100%;
   min-height: 58px;
-  gap: 10px;
-  padding: 10px;
+  gap: 4px;
+  padding: 4px;
   border: 1px solid transparent;
   border-radius: 8px;
   color: var(--text);
   background: transparent;
-  text-align: left;
 }
 
 .server-row:hover,
 .server-row.selected {
   border-color: #93c5fd;
   background: #eaf2ff;
+}
+
+.server-select {
+  display: grid;
+  grid-template-columns: 12px minmax(0, 1fr);
+  align-items: center;
+  width: 100%;
+  min-width: 0;
+  min-height: 48px;
+  gap: 10px;
+  padding: 6px;
+  border: 0;
+  border-radius: 6px;
+  color: inherit;
+  background: transparent;
+  text-align: left;
+}
+
+.server-select:focus-visible,
+.server-delete-button:focus-visible {
+  outline: 2px solid #60a5fa;
+  outline-offset: 2px;
+}
+
+.server-delete-button {
+  border-color: transparent;
+  color: #94a3b8;
+  background: transparent;
+}
+
+.server-row:hover .server-delete-button,
+.server-row.selected .server-delete-button {
+  border-color: #fecdd3;
+  color: #be123c;
+  background: #ffffff;
+}
+
+.server-delete-button:hover:not(:disabled) {
+  border-color: #fda4af;
+  color: #be123c;
+  background: #fff1f2;
 }
 
 .server-main {
@@ -457,6 +497,123 @@ pre {
   white-space: nowrap;
 }
 
+.config-layout .work-panel {
+  display: grid;
+  align-content: start;
+  gap: 16px;
+}
+
+.section-heading {
+  display: flex;
+  align-items: start;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.section-heading .panel-title {
+  margin-bottom: 6px;
+}
+
+.remote-proxy-panel {
+  padding-top: 14px;
+  border-top: 1px solid #e2e8f0;
+}
+
+.proxy-status {
+  color: #64748b;
+  font-size: 12px;
+}
+
+.proxy-status.on {
+  color: #15803d;
+}
+
+.proxy-status.off {
+  color: #be123c;
+}
+
+.toggle-line {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-height: 34px;
+  margin-bottom: 12px;
+  color: #334155;
+  font-size: 13px;
+}
+
+.toggle-line input {
+  width: 16px;
+  min-height: 16px;
+  accent-color: #2563eb;
+}
+
+.proxy-field-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.proxy-field-grid .field-label {
+  margin-bottom: 0;
+}
+
+.proxy-meta {
+  display: grid;
+  grid-template-columns: minmax(0, 1.4fr) minmax(0, 0.6fr);
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.proxy-env-list {
+  display: grid;
+  gap: 7px;
+  max-height: 160px;
+  margin-top: 12px;
+  overflow: auto;
+}
+
+.proxy-env-row {
+  display: grid;
+  grid-template-columns: 112px minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  min-height: 34px;
+  padding: 0 10px;
+  border: 1px solid #d8e2ef;
+  border-radius: 8px;
+  background: #f8fafc;
+}
+
+.proxy-env-row span,
+.proxy-env-row strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.proxy-env-row span {
+  color: #64748b;
+  font-size: 12px;
+}
+
+.proxy-env-row strong {
+  color: #172033;
+  font-family: "Cascadia Code", "Fira Code", Consolas, monospace;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.output-spacer {
+  margin-top: 14px;
+}
+
+.compact-output {
+  flex: 0 0 164px;
+  min-height: 120px;
+}
+
 .field-label {
   display: grid;
   gap: 8px;
@@ -521,6 +678,156 @@ button:focus-visible {
   border-radius: 8px;
   color: #b45309;
   background: #fff7ed;
+}
+
+.active-subscription-line {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  gap: 8px;
+  min-height: 38px;
+  margin-bottom: 12px;
+  padding: 0 11px;
+  border: 1px solid #bfdbfe;
+  border-radius: 8px;
+  color: #1e3a8a;
+  background: #eff6ff;
+}
+
+.active-subscription-line span,
+.active-subscription-line small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.active-subscription-line span {
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.active-subscription-line small {
+  color: #64748b;
+  font-size: 12px;
+}
+
+.subscription-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.subscription-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  gap: 9px;
+  margin-bottom: 14px;
+}
+
+.subscription-card {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 36px;
+  min-width: 0;
+  min-height: 96px;
+  border: 1px solid #d8e2ef;
+  border-radius: 8px;
+  background: #ffffff;
+  transition:
+    border-color 180ms ease,
+    background 180ms ease,
+    box-shadow 180ms ease;
+}
+
+.subscription-card:hover {
+  border-color: #93c5fd;
+  background: #f8fbff;
+}
+
+.subscription-card.selected {
+  border-color: #60a5fa;
+  background: #eff6ff;
+  box-shadow: inset 3px 0 0 #2563eb;
+}
+
+.subscription-card-main {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
+  align-items: start;
+  min-width: 0;
+  gap: 7px;
+  padding: 10px 8px 10px 10px;
+  border: 0;
+  border-radius: 8px 0 0 8px;
+  color: inherit;
+  background: transparent;
+  text-align: left;
+}
+
+.subscription-card-main svg {
+  margin-top: 2px;
+  color: #64748b;
+}
+
+.subscription-card-copy {
+  display: grid;
+  min-width: 0;
+  gap: 5px;
+}
+
+.subscription-card-copy strong,
+.subscription-card-copy span,
+.subscription-card-copy small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.subscription-card-copy strong {
+  color: #172033;
+  font-size: 14px;
+}
+
+.subscription-card-copy span {
+  color: #64748b;
+  font-size: 12px;
+}
+
+.subscription-card-copy small {
+  color: #2563eb;
+  font-size: 12px;
+}
+
+.subscription-card-actions {
+  display: grid;
+  align-content: center;
+  gap: 6px;
+  padding-right: 6px;
+}
+
+.danger-icon {
+  color: #be123c;
+}
+
+.danger-icon:hover:not(:disabled) {
+  border-color: #fda4af;
+  background: #fff1f2;
+}
+
+.subscription-empty {
+  min-height: 84px;
+  padding: 20px 14px;
+  border: 1px dashed #cbd5e1;
+  border-radius: 8px;
+  color: #64748b;
+  background: #f8fafc;
+  font-size: 13px;
+  text-align: center;
+}
+
+.subscription-editor {
+  padding-top: 12px;
+  border-top: 1px solid #e2e8f0;
 }
 
 .egress-result {
@@ -675,6 +982,7 @@ th {
 td {
   color: #1f2937;
   font-size: 13px;
+  vertical-align: middle;
 }
 
 .selected-node-row td {
@@ -694,8 +1002,10 @@ td:last-child {
 
 .row-action {
   display: flex;
+  align-items: center;
   justify-content: flex-end;
   gap: 6px;
+  height: 44px;
 }
 
 .bad-text {

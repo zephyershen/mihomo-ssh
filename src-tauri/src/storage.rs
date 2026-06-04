@@ -3,7 +3,9 @@ use std::path::{Path, PathBuf};
 use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension};
 
-use crate::models::{ImportedHost, ManualServerInput, OperationLog, Server};
+use crate::models::{
+    ImportedHost, ManualServerInput, OperationLog, Server, SubscriptionInput, SubscriptionProfile,
+};
 
 #[derive(Debug, Clone)]
 pub struct Storage {
@@ -57,6 +59,15 @@ impl Storage {
               message TEXT NOT NULL,
               created_at TEXT NOT NULL,
               FOREIGN KEY(server_id) REFERENCES servers(id) ON DELETE SET NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS subscriptions (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              name TEXT NOT NULL,
+              url TEXT NOT NULL UNIQUE,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              last_used_at TEXT
             );
             "#,
         )
@@ -217,6 +228,136 @@ impl Storage {
         self.list_servers()
     }
 
+    pub fn list_subscriptions(&self) -> Result<Vec<SubscriptionProfile>, String> {
+        let conn = self.connect()?;
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT id, name, url, created_at, updated_at, last_used_at
+                FROM subscriptions
+                ORDER BY COALESCE(last_used_at, updated_at) DESC, name COLLATE NOCASE
+                "#,
+            )
+            .map_err(|err| err.to_string())?;
+        let rows = stmt
+            .query_map([], subscription_from_row)
+            .map_err(|err| err.to_string())?;
+
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|err| err.to_string())
+    }
+
+    pub fn get_subscription(&self, subscription_id: i64) -> Result<SubscriptionProfile, String> {
+        let conn = self.connect()?;
+        conn.query_row(
+            r#"
+            SELECT id, name, url, created_at, updated_at, last_used_at
+            FROM subscriptions
+            WHERE id = ?1
+            "#,
+            params![subscription_id],
+            subscription_from_row,
+        )
+        .optional()
+        .map_err(|err| err.to_string())?
+        .ok_or_else(|| format!("subscription {subscription_id} not found"))
+    }
+
+    pub fn save_subscription(
+        &self,
+        input: &SubscriptionInput,
+    ) -> Result<SubscriptionProfile, String> {
+        let conn = self.connect()?;
+        let now = Utc::now().to_rfc3339();
+        let name = input
+            .name
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("Subscription");
+
+        if let Some(id) = input.id {
+            let updated = conn
+                .execute(
+                    r#"
+                    UPDATE subscriptions
+                    SET name = ?1, url = ?2, updated_at = ?3
+                    WHERE id = ?4
+                    "#,
+                    params![name, input.url.as_str(), now, id],
+                )
+                .map_err(|err| err.to_string())?;
+            if updated == 0 {
+                return Err(format!("subscription {id} not found"));
+            }
+            return self.get_subscription(id);
+        }
+
+        conn.execute(
+            r#"
+            INSERT INTO subscriptions (name, url, created_at, updated_at)
+            VALUES (?1, ?2, ?3, ?3)
+            ON CONFLICT(url) DO UPDATE SET
+              name = excluded.name,
+              updated_at = excluded.updated_at
+            "#,
+            params![name, input.url.as_str(), now],
+        )
+        .map_err(|err| err.to_string())?;
+        self.get_subscription_by_url(&input.url)
+    }
+
+    pub fn delete_subscription(
+        &self,
+        subscription_id: i64,
+    ) -> Result<Vec<SubscriptionProfile>, String> {
+        let conn = self.connect()?;
+        let deleted = conn
+            .execute(
+                "DELETE FROM subscriptions WHERE id = ?1",
+                params![subscription_id],
+            )
+            .map_err(|err| err.to_string())?;
+        if deleted == 0 {
+            return Err(format!("subscription {subscription_id} not found"));
+        }
+        self.list_subscriptions()
+    }
+
+    pub fn mark_subscription_used(
+        &self,
+        subscription_id: i64,
+    ) -> Result<SubscriptionProfile, String> {
+        let conn = self.connect()?;
+        let now = Utc::now().to_rfc3339();
+        let updated = conn
+            .execute(
+                "UPDATE subscriptions SET last_used_at = ?1, updated_at = ?1 WHERE id = ?2",
+                params![now, subscription_id],
+            )
+            .map_err(|err| err.to_string())?;
+        if updated == 0 {
+            return Err(format!("subscription {subscription_id} not found"));
+        }
+        self.get_subscription(subscription_id)
+    }
+
+    fn get_subscription_by_url(&self, url: &str) -> Result<SubscriptionProfile, String> {
+        let conn = self.connect()?;
+        conn.query_row(
+            r#"
+            SELECT id, name, url, created_at, updated_at, last_used_at
+            FROM subscriptions
+            WHERE url = ?1
+            "#,
+            params![url],
+            subscription_from_row,
+        )
+        .optional()
+        .map_err(|err| err.to_string())?
+        .ok_or_else(|| "subscription not found after save".to_string())
+    }
+
     pub fn update_status(&self, server_id: i64, status: &str) -> Result<(), String> {
         let conn = self.connect()?;
         conn.execute(
@@ -339,5 +480,16 @@ fn log_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<OperationLog> {
         status: row.get(3)?,
         message: row.get(4)?,
         created_at: row.get(5)?,
+    })
+}
+
+fn subscription_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SubscriptionProfile> {
+    Ok(SubscriptionProfile {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        url: row.get(2)?,
+        created_at: row.get(3)?,
+        updated_at: row.get(4)?,
+        last_used_at: row.get(5)?,
     })
 }

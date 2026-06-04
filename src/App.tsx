@@ -8,6 +8,7 @@ import {
   FileText,
   Gauge,
   Globe,
+  GripVertical,
   KeyRound,
   ListRestart,
   Loader2,
@@ -44,9 +45,13 @@ import type {
   OperationLog,
   ProxyGroup,
   ProxyNode,
+  RemoteProxyConfig,
+  RemoteProxyInput,
   Server,
   ServerBootstrapInput,
   ServerHealth,
+  SubscriptionInput,
+  SubscriptionProfile,
 } from "./types";
 
 type Tab = "overview" | "install" | "subscription" | "nodes" | "config" | "logs" | "updates";
@@ -56,6 +61,25 @@ type ServerDraft = {
   user: string;
   port: string;
   password: string;
+};
+type SubscriptionDraft = {
+  id: number | null;
+  name: string;
+  url: string;
+};
+
+const emptySubscriptionDraft: SubscriptionDraft = {
+  id: null,
+  name: "",
+  url: "",
+};
+
+const defaultRemoteProxyInput: RemoteProxyInput = {
+  enabled: true,
+  httpProxy: "http://127.0.0.1:7890",
+  httpsProxy: "http://127.0.0.1:7890",
+  allProxy: "socks5h://127.0.0.1:7890",
+  noProxy: "localhost,127.0.0.1,::1,10.40.2.0/24",
 };
 
 const tabs: Array<{ id: Tab; label: string; icon: typeof Activity }> = [
@@ -87,10 +111,16 @@ export function App() {
   const [commandOutput, setCommandOutput] = useState<string>("");
   const [egressUrl, setEgressUrl] = useState("https://www.gstatic.com/generate_204");
   const [egressResult, setEgressResult] = useState<EgressTestResult | null>(null);
-  const [subscriptionUrl, setSubscriptionUrl] = useState("");
+  const [subscriptions, setSubscriptions] = useState<SubscriptionProfile[]>([]);
+  const [selectedSubscriptionId, setSelectedSubscriptionId] = useState<number | null>(null);
+  const [subscriptionDraft, setSubscriptionDraft] =
+    useState<SubscriptionDraft>(emptySubscriptionDraft);
   const [groups, setGroups] = useState<ProxyGroup[]>([]);
   const [selectedGroup, setSelectedGroup] = useState<string>("");
   const [measuredNodes, setMeasuredNodes] = useState<ProxyNode[]>([]);
+  const [remoteProxy, setRemoteProxy] = useState<RemoteProxyConfig | null>(null);
+  const [remoteProxyDraft, setRemoteProxyDraft] =
+    useState<RemoteProxyInput>(defaultRemoteProxyInput);
   const [logs, setLogs] = useState("");
   const [operationLogs, setOperationLogs] = useState<OperationLog[]>([]);
   const [updateStatus, setUpdateStatus] = useState<AppUpdateStatus | null>(null);
@@ -103,6 +133,10 @@ export function App() {
     () => servers.find((server) => server.id === selectedId) ?? null,
     [servers, selectedId],
   );
+  const selectedSubscription = useMemo(
+    () => subscriptions.find((subscription) => subscription.id === selectedSubscriptionId) ?? null,
+    [selectedSubscriptionId, subscriptions],
+  );
 
   const loadServers = useCallback(async () => {
     const next = await api.listServers();
@@ -112,19 +146,37 @@ export function App() {
     );
   }, []);
 
+  const loadSubscriptions = useCallback(async () => {
+    const next = await api.listSubscriptions();
+    setSubscriptions(next);
+    const first = next[0] ?? null;
+    setSelectedSubscriptionId(first?.id ?? null);
+    setSubscriptionDraft(first ? draftFromSubscription(first) : emptySubscriptionDraft);
+  }, []);
+
   useEffect(() => {
     void loadServers().catch((error) => setToast(String(error)));
-  }, [loadServers]);
+    void loadSubscriptions().catch((error) => setToast(String(error)));
+  }, [loadServers, loadSubscriptions]);
 
   useEffect(() => {
     if (!selectedId) {
       return;
     }
     setEgressResult(null);
+    setRemoteProxy(null);
     void refreshHealth(selectedId);
     void refreshOperationLogs(selectedId);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedId]);
+
+  useEffect(() => {
+    if (activeTab !== "config" || !selectedId) {
+      return;
+    }
+    void refreshRemoteProxy(selectedId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTab, selectedId]);
 
   useEffect(() => {
     if (!toast || busy) {
@@ -172,13 +224,51 @@ export function App() {
     }
   }
 
-  async function command(label: string, work: () => Promise<CommandResult>) {
+  async function refreshRemoteProxy(id = selectedId) {
+    if (!id) return;
+    await run("读取远端代理", () => api.inspectRemoteProxy(id), (next) => {
+      setRemoteProxy(next);
+      setRemoteProxyDraft(remoteProxyInputFromConfig(next));
+    });
+  }
+
+  async function command(label: string, work: () => Promise<CommandResult>): Promise<CommandResult | undefined> {
     const result = await run(label, work);
     if (result) {
       setCommandOutput(redactForDisplay(result.ok ? result.stdout || "ok" : result.stderr || "failed"));
       void refreshHealth();
       void refreshOperationLogs();
     }
+    return result;
+  }
+
+  function updateRemoteProxyDraft(field: keyof RemoteProxyInput, value: string | boolean) {
+    setRemoteProxyDraft((current) => ({ ...current, [field]: value }));
+  }
+
+  async function saveRemoteProxyDraft() {
+    if (!selected) return;
+    const result = await command("保存远端代理", () =>
+      api.saveRemoteProxy(selected.id, remoteProxyDraft),
+    );
+    if (result?.ok) {
+      void refreshRemoteProxy(selected.id);
+    }
+  }
+
+  async function setRemoteProxyState(enabled: boolean) {
+    if (!selected) return;
+    const result = await command(enabled ? "打开远端代理" : "关闭远端代理", () =>
+      api.setRemoteProxyEnabled(selected.id, enabled),
+    );
+    if (result?.ok) {
+      void refreshRemoteProxy(selected.id);
+    }
+  }
+
+  async function restartRemoteProxyService() {
+    if (!selected) return;
+    await command("重启远端代理服务", () => service(selected.id, "restart"));
   }
 
   async function importHosts() {
@@ -257,23 +347,116 @@ export function App() {
     });
   }
 
-  async function deleteSelectedServer() {
-    if (!selected) return;
+  async function deleteServer(serverToDelete: Server) {
     const confirmed = window.confirm(
-      `删除本地服务器条目 "${selected.displayName}"？这不会删除远端服务器或远端 mihomo。`,
+      `删除本地服务器条目 "${serverToDelete.displayName}"？这不会删除远端服务器或远端 mihomo。`,
     );
     if (!confirmed) return;
 
-    await run("删除服务器", () => api.deleteServer(selected.id), (next) => {
+    await run("删除服务器", () => api.deleteServer(serverToDelete.id), (next) => {
       setServers(next);
-      setSelectedId(next[0]?.id ?? null);
-      setHealth(null);
-      setGroups([]);
-      setMeasuredNodes([]);
-      setLogs("");
-      setOperationLogs([]);
-      setCommandOutput("");
-      setEgressResult(null);
+      const selectedStillExists = next.some((server) => server.id === selectedId);
+      const shouldMoveSelection = serverToDelete.id === selectedId || !selectedStillExists;
+      setSelectedId(shouldMoveSelection ? (next[0]?.id ?? null) : selectedId);
+      if (shouldMoveSelection) {
+        setHealth(null);
+        setGroups([]);
+        setMeasuredNodes([]);
+        setLogs("");
+        setOperationLogs([]);
+        setCommandOutput("");
+        setEgressResult(null);
+      }
+    });
+  }
+
+  function updateSubscriptionDraft(field: "name" | "url", value: string) {
+    setSubscriptionDraft((current) => ({ ...current, [field]: value }));
+  }
+
+  function selectSubscriptionProfile(profile: SubscriptionProfile) {
+    setSelectedSubscriptionId(profile.id);
+    setSubscriptionDraft(draftFromSubscription(profile));
+  }
+
+  function newSubscriptionDraft() {
+    setSelectedSubscriptionId(null);
+    setSubscriptionDraft(emptySubscriptionDraft);
+  }
+
+  function upsertSubscription(profile: SubscriptionProfile) {
+    setSubscriptions((current) =>
+      sortSubscriptions([profile, ...current.filter((item) => item.id !== profile.id)]),
+    );
+    selectSubscriptionProfile(profile);
+  }
+
+  async function saveCurrentSubscription(): Promise<SubscriptionProfile | undefined> {
+    const url = subscriptionDraft.url.trim();
+    if (!url) {
+      setToast("请先填写订阅链接");
+      return undefined;
+    }
+
+    const input: SubscriptionInput = {
+      id: subscriptionDraft.id,
+      name: subscriptionDraft.name.trim() || null,
+      url,
+    };
+    return run("保存订阅", () => api.saveSubscription(input), upsertSubscription);
+  }
+
+  async function markSubscriptionUsed(subscriptionId: number) {
+    try {
+      const profile = await api.markSubscriptionUsed(subscriptionId);
+      upsertSubscription(profile);
+    } catch {
+      // 最近使用时间只影响本地排序，失败不影响远端订阅更新结果。
+    }
+  }
+
+  async function saveAndRefreshSubscription() {
+    if (!selected) return;
+    const profile = await saveCurrentSubscription();
+    if (!profile) return;
+    const result = await command("更新订阅", () => api.updateSubscription(selected.id, profile.url));
+    if (result?.ok) {
+      void markSubscriptionUsed(profile.id);
+    }
+  }
+
+  async function refreshSubscriptionProfile(profile: SubscriptionProfile) {
+    if (!selected) return;
+    selectSubscriptionProfile(profile);
+    const result = await command("更新订阅", () => api.updateSubscription(selected.id, profile.url));
+    if (result?.ok) {
+      void markSubscriptionUsed(profile.id);
+    }
+  }
+
+  async function installOrRepairSelected() {
+    if (!selected) return;
+    const subscriptionUrl = subscriptionDraft.url.trim() || selectedSubscription?.url || "";
+    const result = await command("安装/修复 mihomo", () =>
+      api.installOrRepairMihomo(selected.id, subscriptionUrl),
+    );
+    if (result?.ok && subscriptionDraft.id) {
+      void markSubscriptionUsed(subscriptionDraft.id);
+    }
+  }
+
+  async function deleteSubscriptionProfile(profile: SubscriptionProfile) {
+    const confirmed = window.confirm(`删除本地订阅 "${profile.name}"？这不会删除远端已保存的订阅。`);
+    if (!confirmed) return;
+
+    await run("删除订阅", () => api.deleteSubscription(profile.id), (next) => {
+      setSubscriptions(next);
+      const replacement =
+        selectedSubscriptionId === profile.id
+          ? next[0] ?? null
+          : next.find((item) => item.id === selectedSubscriptionId) ?? next[0] ?? null;
+      setSelectedSubscriptionId(replacement?.id ?? null);
+      setSubscriptionDraft(replacement ? draftFromSubscription(replacement) : emptySubscriptionDraft);
     });
   }
 
@@ -419,21 +602,39 @@ export function App() {
 
         <div className="server-list">
           {servers.map((server) => (
-            <button
+            <div
               key={server.id}
               className={`server-row ${server.id === selectedId ? "selected" : ""}`}
-              onClick={() => setSelectedId(server.id)}
             >
-              <StatusDot status={server.lastStatus} />
-              <span className="server-main">
-                <span className="server-name">{server.displayName}</span>
-                <span className="server-address">
-                  {server.user ? `${server.user}@` : ""}
-                  {server.hostName}
-                  {server.port ? `:${server.port}` : ""}
+              <button
+                type="button"
+                className="server-select"
+                title={`选择 ${server.displayName}`}
+                onClick={() => setSelectedId(server.id)}
+              >
+                <StatusDot status={server.lastStatus} />
+                <span className="server-main">
+                  <span className="server-name">{server.displayName}</span>
+                  <span className="server-address">
+                    {server.user ? `${server.user}@` : ""}
+                    {server.hostName}
+                    {server.port ? `:${server.port}` : ""}
+                  </span>
                 </span>
-              </span>
-            </button>
+              </button>
+              <button
+                type="button"
+                className="icon-button small server-delete-button"
+                title={`删除本地服务器条目：${server.displayName}`}
+                disabled={!!busy}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  void deleteServer(server);
+                }}
+              >
+                <Trash2 size={15} />
+              </button>
+            </div>
           ))}
           {!servers.length && <div className="empty-state">No hosts imported</div>}
         </div>
@@ -455,10 +656,6 @@ export function App() {
             <button className="tool-button" title="刷新健康状态" disabled={!selected || !!busy} onClick={() => refreshHealth()}>
               <RefreshCcw size={16} />
               Refresh
-            </button>
-            <button className="tool-button danger-text" title="删除本地服务器条目" disabled={!selected || !!busy} onClick={deleteSelectedServer}>
-              <Trash2 size={16} />
-              Delete
             </button>
           </div>
         </header>
@@ -500,12 +697,10 @@ export function App() {
               selected={selected}
               health={health}
               busy={busy}
-              subscriptionUrl={subscriptionUrl}
-              setSubscriptionUrl={setSubscriptionUrl}
-              onInstall={() =>
-                selected &&
-                command("安装/修复 mihomo", () => api.installOrRepairMihomo(selected.id, subscriptionUrl))
-              }
+              subscription={selectedSubscription}
+              subscriptionUrl={subscriptionDraft.url}
+              setSubscriptionUrl={(value) => updateSubscriptionDraft("url", value)}
+              onInstall={installOrRepairSelected}
               onInspect={() => refreshHealth()}
               output={commandOutput}
             />
@@ -516,10 +711,17 @@ export function App() {
               selected={selected}
               health={health}
               busy={busy}
-              subscriptionUrl={subscriptionUrl}
-              setSubscriptionUrl={setSubscriptionUrl}
-              onUpdate={() =>
-                selected && command("更新订阅", () => api.updateSubscription(selected.id, subscriptionUrl))
+              subscriptions={subscriptions}
+              selectedSubscriptionId={selectedSubscriptionId}
+              draft={subscriptionDraft}
+              onDraftChange={updateSubscriptionDraft}
+              onSelect={selectSubscriptionProfile}
+              onNew={newSubscriptionDraft}
+              onSaveRefresh={saveAndRefreshSubscription}
+              onRefreshProfile={refreshSubscriptionProfile}
+              onDeleteProfile={deleteSubscriptionProfile}
+              onRefreshSaved={() =>
+                selected && command("刷新已保存订阅", () => api.updateSubscription(selected.id))
               }
               output={commandOutput}
             />
@@ -543,7 +745,22 @@ export function App() {
             />
           )}
 
-          {activeTab === "config" && <ConfigPanel health={health} selected={selected} />}
+          {activeTab === "config" && (
+            <ConfigPanel
+              health={health}
+              selected={selected}
+              busy={busy}
+              remoteProxy={remoteProxy}
+              remoteProxyDraft={remoteProxyDraft}
+              commandOutput={commandOutput}
+              onProxyDraftChange={updateRemoteProxyDraft}
+              onProxyRead={() => refreshRemoteProxy()}
+              onProxySave={saveRemoteProxyDraft}
+              onProxyEnable={() => setRemoteProxyState(true)}
+              onProxyDisable={() => setRemoteProxyState(false)}
+              onProxyRestart={restartRemoteProxyService}
+            />
+          )}
 
           {activeTab === "logs" && (
             <LogsPanel
@@ -828,6 +1045,7 @@ function InstallPanel(props: {
   selected: Server | null;
   health: ServerHealth | null;
   busy: string | null;
+  subscription: SubscriptionProfile | null;
   subscriptionUrl: string;
   setSubscriptionUrl: (value: string) => void;
   onInstall: () => void;
@@ -838,6 +1056,13 @@ function InstallPanel(props: {
     <div className="split-layout">
       <div className="work-panel">
         <div className="panel-title">Install</div>
+        {props.subscription && (
+          <div className="active-subscription-line">
+            <CheckCircle2 size={15} />
+            <span>{props.subscription.name}</span>
+            <small>{subscriptionHost(props.subscription.url)}</small>
+          </div>
+        )}
         <SecretInput value={props.subscriptionUrl} onChange={props.setSubscriptionUrl} />
         <div className="button-row">
           <button className="command-button primary" disabled={!props.selected || !!props.busy} onClick={props.onInstall}>
@@ -860,24 +1085,80 @@ function SubscriptionPanel(props: {
   selected: Server | null;
   health: ServerHealth | null;
   busy: string | null;
-  subscriptionUrl: string;
-  setSubscriptionUrl: (value: string) => void;
-  onUpdate: () => void;
+  subscriptions: SubscriptionProfile[];
+  selectedSubscriptionId: number | null;
+  draft: SubscriptionDraft;
+  onDraftChange: (field: "name" | "url", value: string) => void;
+  onSelect: (profile: SubscriptionProfile) => void;
+  onNew: () => void;
+  onSaveRefresh: () => void;
+  onRefreshProfile: (profile: SubscriptionProfile) => void;
+  onDeleteProfile: (profile: SubscriptionProfile) => void;
+  onRefreshSaved: () => void;
   output: string;
 }) {
   return (
     <div className="split-layout">
       <div className="work-panel">
         <div className="panel-title">Subscription</div>
-        <SecretInput value={props.subscriptionUrl} onChange={props.setSubscriptionUrl} />
+        <div className="subscription-toolbar">
+          <button className="command-button" disabled={!!props.busy} onClick={props.onNew}>
+            <Plus size={17} />
+            新建
+          </button>
+          <button
+            className="command-button"
+            disabled={!props.selected || !!props.busy || !props.health?.hasSubscription}
+            title="使用服务器上已保存的订阅地址刷新"
+            onClick={props.onRefreshSaved}
+          >
+            <RefreshCcw size={17} />
+            刷新远端保存
+          </button>
+        </div>
+
+        <div className="subscription-list">
+          {props.subscriptions.map((profile) => (
+            <SubscriptionCard
+              key={profile.id}
+              profile={profile}
+              selected={profile.id === props.selectedSubscriptionId}
+              busy={props.busy}
+              disabled={!props.selected}
+              onSelect={() => props.onSelect(profile)}
+              onRefresh={() => props.onRefreshProfile(profile)}
+              onDelete={() => props.onDeleteProfile(profile)}
+            />
+          ))}
+          {!props.subscriptions.length && (
+            <div className="subscription-empty">还没有订阅。填写下面的名称和链接后保存。</div>
+          )}
+        </div>
+
+        <div className="subscription-editor">
+          <label className="field-label">
+            <span>名称</span>
+            <input
+              value={props.draft.name}
+              placeholder="Cyber Paws"
+              onChange={(event) => props.onDraftChange("name", event.target.value)}
+            />
+          </label>
+          <SecretInput value={props.draft.url} onChange={(value) => props.onDraftChange("url", value)} />
+        </div>
+
         <div className="button-row">
-          <button className="command-button primary" disabled={!props.selected || !!props.busy} onClick={props.onUpdate}>
+          <button
+            className="command-button primary"
+            disabled={!props.selected || !!props.busy || !props.draft.url.trim()}
+            onClick={props.onSaveRefresh}
+          >
             <ListRestart size={17} />
-            Update
+            保存并刷新
           </button>
         </div>
         <div className="kv-grid compact">
-          <KeyValue label="Saved URL" value={props.health?.hasSubscription ? "yes" : "no"} />
+          <KeyValue label="远端已保存" value={props.health?.hasSubscription ? "yes" : "no"} />
           <KeyValue label="mixed-port" value={props.health?.mixedPort} />
           <KeyValue label="allow-lan" value={String(props.health?.allowLan ?? "unknown")} />
           <KeyValue label="geo update" value={String(props.health?.geoAutoUpdate ?? "unknown")} />
@@ -890,6 +1171,55 @@ function SubscriptionPanel(props: {
         )}
       </div>
       <OutputPanel output={props.output} />
+    </div>
+  );
+}
+
+function SubscriptionCard(props: {
+  profile: SubscriptionProfile;
+  selected: boolean;
+  busy: string | null;
+  disabled: boolean;
+  onSelect: () => void;
+  onRefresh: () => void;
+  onDelete: () => void;
+}) {
+  const time = props.profile.lastUsedAt ?? props.profile.updatedAt;
+  return (
+    <div className={`subscription-card ${props.selected ? "selected" : ""}`}>
+      <button
+        type="button"
+        className="subscription-card-main"
+        title={`选择 ${props.profile.name}`}
+        onClick={props.onSelect}
+      >
+        <GripVertical size={17} />
+        <span className="subscription-card-copy">
+          <strong>{props.profile.name}</strong>
+          <span>{subscriptionHost(props.profile.url)}</span>
+          <small>{formatShortTime(time)}</small>
+        </span>
+      </button>
+      <div className="subscription-card-actions">
+        <button
+          type="button"
+          className="icon-button small"
+          title="用这条订阅刷新远端配置"
+          disabled={props.disabled || !!props.busy}
+          onClick={props.onRefresh}
+        >
+          <RefreshCcw size={15} />
+        </button>
+        <button
+          type="button"
+          className="icon-button small danger-icon"
+          title="删除本地订阅"
+          disabled={!!props.busy}
+          onClick={props.onDelete}
+        >
+          <Trash2 size={15} />
+        </button>
+      </div>
     </div>
   );
 }
@@ -1005,9 +1335,23 @@ function NodesPanel(props: {
   );
 }
 
-function ConfigPanel({ health, selected }: { health: ServerHealth | null; selected: Server | null }) {
+function ConfigPanel(props: {
+  health: ServerHealth | null;
+  selected: Server | null;
+  busy: string | null;
+  remoteProxy: RemoteProxyConfig | null;
+  remoteProxyDraft: RemoteProxyInput;
+  commandOutput: string;
+  onProxyDraftChange: (field: keyof RemoteProxyInput, value: string | boolean) => void;
+  onProxyRead: () => void;
+  onProxySave: () => void;
+  onProxyEnable: () => void;
+  onProxyDisable: () => void;
+  onProxyRestart: () => void;
+}) {
+  const { health, selected } = props;
   return (
-    <div className="split-layout">
+    <div className="split-layout config-layout">
       <div className="work-panel">
         <div className="panel-title">Key Fields</div>
         <div className="kv-grid">
@@ -1020,11 +1364,135 @@ function ConfigPanel({ health, selected }: { health: ServerHealth | null; select
           <KeyValue label="allow-lan" value={String(health?.allowLan ?? "unknown")} />
           <KeyValue label="geo-auto-update" value={String(health?.geoAutoUpdate ?? "unknown")} />
         </div>
+        <RemoteProxyPanel
+          selected={selected}
+          busy={props.busy}
+          config={props.remoteProxy}
+          draft={props.remoteProxyDraft}
+          onDraftChange={props.onProxyDraftChange}
+          onRead={props.onProxyRead}
+          onSave={props.onProxySave}
+          onEnable={props.onProxyEnable}
+          onDisable={props.onProxyDisable}
+          onRestart={props.onProxyRestart}
+        />
       </div>
       <div className="output-panel">
         <div className="panel-title">YAML Preview</div>
         <pre>{redactForDisplay(health?.configPreview ?? "")}</pre>
+        <div className="panel-title output-spacer">Command Output</div>
+        <pre className="compact-output">{props.commandOutput}</pre>
       </div>
+    </div>
+  );
+}
+
+function RemoteProxyPanel(props: {
+  selected: Server | null;
+  busy: string | null;
+  config: RemoteProxyConfig | null;
+  draft: RemoteProxyInput;
+  onDraftChange: (field: keyof RemoteProxyInput, value: string | boolean) => void;
+  onRead: () => void;
+  onSave: () => void;
+  onEnable: () => void;
+  onDisable: () => void;
+  onRestart: () => void;
+}) {
+  const status = props.config?.enabled ? "已打开" : props.config ? "已关闭" : "未读取";
+  return (
+    <div className="remote-proxy-panel">
+      <div className="section-heading">
+        <div>
+          <div className="panel-title">Remote Proxy</div>
+          <div className={`proxy-status ${props.config?.enabled ? "on" : "off"}`}>
+            {status}
+            {props.config?.managed ? " · app 管理" : " · 未接管"}
+          </div>
+        </div>
+        <button className="icon-button" title="读取远端代理" disabled={!props.selected || !!props.busy} onClick={props.onRead}>
+          <RefreshCcw size={16} />
+        </button>
+      </div>
+
+      <label className="toggle-line">
+        <input
+          type="checkbox"
+          checked={props.draft.enabled}
+          onChange={(event) => props.onDraftChange("enabled", event.target.checked)}
+        />
+        <span>保存时启用代理环境变量</span>
+      </label>
+
+      <div className="proxy-field-grid">
+        <label className="field-label">
+          <span>http_proxy / HTTP_PROXY</span>
+          <input
+            value={props.draft.httpProxy}
+            placeholder="http://127.0.0.1:7890"
+            onChange={(event) => props.onDraftChange("httpProxy", event.target.value)}
+          />
+        </label>
+        <label className="field-label">
+          <span>https_proxy / HTTPS_PROXY</span>
+          <input
+            value={props.draft.httpsProxy}
+            placeholder="http://127.0.0.1:7890"
+            onChange={(event) => props.onDraftChange("httpsProxy", event.target.value)}
+          />
+        </label>
+        <label className="field-label">
+          <span>all_proxy / ALL_PROXY</span>
+          <input
+            value={props.draft.allProxy}
+            placeholder="socks5h://127.0.0.1:7890"
+            onChange={(event) => props.onDraftChange("allProxy", event.target.value)}
+          />
+        </label>
+        <label className="field-label">
+          <span>no_proxy / NO_PROXY</span>
+          <input
+            value={props.draft.noProxy}
+            placeholder="localhost,127.0.0.1,::1,10.40.2.0/24"
+            onChange={(event) => props.onDraftChange("noProxy", event.target.value)}
+          />
+        </label>
+      </div>
+
+      <div className="button-row">
+        <button className="command-button primary" disabled={!props.selected || !!props.busy} onClick={props.onSave}>
+          <Save size={17} />
+          保存
+        </button>
+        <button className="command-button" disabled={!props.selected || !!props.busy} onClick={props.onEnable}>
+          <Power size={17} />
+          打开
+        </button>
+        <button className="command-button danger" disabled={!props.selected || !!props.busy} onClick={props.onDisable}>
+          <PowerOff size={17} />
+          关闭
+        </button>
+        <button className="command-button" disabled={!props.selected || !!props.busy} onClick={props.onRestart}>
+          <RotateCw size={17} />
+          重启 Mihomo
+        </button>
+      </div>
+
+      <div className="proxy-meta">
+        <KeyValue label="Profile" value={props.config?.profilePath ?? "/etc/profile.d/mihomo-manager-proxy.sh"} />
+        <KeyValue label="Detected" value={`${props.config?.detectedEnv.length ?? 0} vars`} />
+      </div>
+
+      {props.config?.detectedEnv.length ? (
+        <div className="proxy-env-list">
+          {props.config.detectedEnv.map((item) => (
+            <div key={`${item.name}:${item.value}`} className="proxy-env-row">
+              <span>{item.name}</span>
+              <strong>{item.value}</strong>
+            </div>
+          ))}
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -1142,4 +1610,50 @@ function KeyValue({ label, value }: { label: string; value?: string | number | n
 function StatusDot({ status }: { status?: string | null }) {
   const className = status === "online" ? "online" : status === "error" || status === "offline" ? "offline" : "";
   return <span className={`status-dot ${className}`} />;
+}
+
+function draftFromSubscription(profile: SubscriptionProfile): SubscriptionDraft {
+  return {
+    id: profile.id,
+    name: profile.name,
+    url: profile.url,
+  };
+}
+
+function sortSubscriptions(profiles: SubscriptionProfile[]): SubscriptionProfile[] {
+  return [...profiles].sort((left, right) => {
+    const leftTime = left.lastUsedAt ?? left.updatedAt;
+    const rightTime = right.lastUsedAt ?? right.updatedAt;
+    return rightTime.localeCompare(leftTime) || left.name.localeCompare(right.name);
+  });
+}
+
+function subscriptionHost(url: string): string {
+  try {
+    return new URL(url).hostname.replace(/^www\./, "") || "unknown host";
+  } catch {
+    return "invalid url";
+  }
+}
+
+function formatShortTime(value?: string | null): string {
+  if (!value) return "未使用";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "未知时间";
+  return date.toLocaleString(undefined, {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+function remoteProxyInputFromConfig(config: RemoteProxyConfig): RemoteProxyInput {
+  return {
+    enabled: config.enabled,
+    httpProxy: config.httpProxy ?? defaultRemoteProxyInput.httpProxy,
+    httpsProxy: config.httpsProxy ?? defaultRemoteProxyInput.httpsProxy,
+    allProxy: config.allProxy ?? defaultRemoteProxyInput.allProxy,
+    noProxy: config.noProxy ?? defaultRemoteProxyInput.noProxy,
+  };
 }

@@ -95,3 +95,42 @@ export type OperationLog = {
   message: string;
   createdAt: string;
 };
+
+export type SubscriptionProfile = {
+  id: number;
+  name: string;
+  url: string;
+  createdAt: string;
+  updatedAt: string;
+  lastUsedAt?: string | null;
+};
+
+export type SubscriptionInput = {
+  id?: number | null;
+  name?: string | null;
+  url: string;
+};
+
+export type RemoteProxyEnvVar = {
+  name: string;
+  value: string;
+};
+
+export type RemoteProxyConfig = {
+  enabled: boolean;
+  managed: boolean;
+  profilePath: string;
+  httpProxy?: string | null;
+  httpsProxy?: string | null;
+  allProxy?: string | null;
+  noProxy?: string | null;
+  detectedEnv: RemoteProxyEnvVar[];
+};
+
+export type RemoteProxyInput = {
+  enabled: boolean;
+  httpProxy: string;
+  httpsProxy: string;
+  allProxy: string;
+  noProxy: string;
+};

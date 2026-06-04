@@ -1,6 +1,7 @@
 mod controller;
 mod mihomo;
 mod models;
+mod remote_proxy;
 mod redaction;
 mod ssh;
 mod storage;
@@ -9,8 +10,9 @@ use std::{path::PathBuf, time::Duration};
 
 use models::{
     CommandResult, EgressTestResult, InstallOptions, ManagedSshKeyInfo, ManualServerInput,
-    OperationLog, ProxyGroup, ProxyNode, Server, ServerBootstrapInput, ServerHealth,
-    ServiceCommandResult, SubscriptionUpdateOptions, TunnelInfo,
+    OperationLog, ProxyGroup, ProxyNode, RemoteProxyConfig, RemoteProxyInput, Server,
+    ServerBootstrapInput, ServerHealth, ServiceCommandResult, SubscriptionInput,
+    SubscriptionProfile, SubscriptionUpdateOptions, TunnelInfo,
 };
 use reqwest::Url;
 use storage::Storage;
@@ -135,6 +137,51 @@ fn list_operation_logs(
     limit: Option<u32>,
 ) -> Result<Vec<OperationLog>, String> {
     state.storage.list_logs(server_id, limit.unwrap_or(120))
+}
+
+#[tauri::command]
+fn list_subscriptions(state: State<'_, AppState>) -> Result<Vec<SubscriptionProfile>, String> {
+    state.storage.list_subscriptions()
+}
+
+#[tauri::command]
+fn save_subscription(
+    state: State<'_, AppState>,
+    input: SubscriptionInput,
+) -> Result<SubscriptionProfile, String> {
+    let input = normalize_subscription_input(input)?;
+    let profile = state.storage.save_subscription(&input)?;
+    state.storage.add_log(
+        None,
+        "save_subscription",
+        "ok",
+        &format!("saved {}", profile.name),
+    )?;
+    Ok(profile)
+}
+
+#[tauri::command]
+fn delete_subscription(
+    state: State<'_, AppState>,
+    subscription_id: i64,
+) -> Result<Vec<SubscriptionProfile>, String> {
+    let profile = state.storage.get_subscription(subscription_id)?;
+    let next = state.storage.delete_subscription(subscription_id)?;
+    state.storage.add_log(
+        None,
+        "delete_subscription",
+        "ok",
+        &format!("removed {}", profile.name),
+    )?;
+    Ok(next)
+}
+
+#[tauri::command]
+fn mark_subscription_used(
+    state: State<'_, AppState>,
+    subscription_id: i64,
+) -> Result<SubscriptionProfile, String> {
+    state.storage.mark_subscription_used(subscription_id)
 }
 
 #[tauri::command]
@@ -273,6 +320,52 @@ fn set_mihomo_service(
         server_id,
         &format!("service:{service_state}"),
         &result.output,
+    )?;
+    Ok(result)
+}
+
+#[tauri::command]
+fn inspect_remote_proxy(
+    state: State<'_, AppState>,
+    server_id: i64,
+) -> Result<RemoteProxyConfig, String> {
+    let server = state.storage.get_server(server_id)?;
+    let result = remote_proxy::inspect(&server)?;
+    state
+        .storage
+        .add_log(Some(server_id), "inspect_remote_proxy", "ok", "loaded")?;
+    Ok(result)
+}
+
+#[tauri::command]
+fn save_remote_proxy(
+    state: State<'_, AppState>,
+    server_id: i64,
+    input: RemoteProxyInput,
+) -> Result<CommandResult, String> {
+    let server = state.storage.get_server(server_id)?;
+    let result = remote_proxy::save(&server, input)?;
+    log_command(&state.storage, server_id, "save_remote_proxy", &result)?;
+    Ok(result)
+}
+
+#[tauri::command]
+fn set_remote_proxy_enabled(
+    state: State<'_, AppState>,
+    server_id: i64,
+    enabled: bool,
+) -> Result<CommandResult, String> {
+    let server = state.storage.get_server(server_id)?;
+    let result = remote_proxy::set_enabled(&server, enabled)?;
+    log_command(
+        &state.storage,
+        server_id,
+        if enabled {
+            "enable_remote_proxy"
+        } else {
+            "disable_remote_proxy"
+        },
+        &result,
     )?;
     Ok(result)
 }
@@ -421,6 +514,40 @@ fn normalize_test_url(input: &str) -> Result<String, String> {
     }
 }
 
+fn normalize_subscription_input(mut input: SubscriptionInput) -> Result<SubscriptionInput, String> {
+    input.url = normalize_subscription_url(&input.url)?;
+    input.name = input
+        .name
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| Some(subscription_name_from_url(&input.url)));
+    Ok(input)
+}
+
+fn normalize_subscription_url(input: &str) -> Result<String, String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err("订阅链接不能为空".to_string());
+    }
+    if trimmed.chars().any(char::is_control) || trimmed.chars().any(char::is_whitespace) {
+        return Err("订阅链接不能包含空格或控制字符".to_string());
+    }
+    let parsed = Url::parse(trimmed).map_err(|err| format!("无效订阅链接：{err}"))?;
+    match parsed.scheme() {
+        "http" | "https" => Ok(trimmed.to_string()),
+        _ => Err("订阅链接只支持 http 和 https".to_string()),
+    }
+}
+
+fn subscription_name_from_url(url: &str) -> String {
+    Url::parse(url)
+        .ok()
+        .and_then(|parsed| parsed.host_str().map(ToString::to_string))
+        .map(|host| host.trim_start_matches("www.").to_string())
+        .filter(|host| !host.is_empty())
+        .unwrap_or_else(|| "Subscription".to_string())
+}
+
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
@@ -552,12 +679,19 @@ pub fn run() {
             bootstrap_server_with_password,
             delete_server,
             list_operation_logs,
+            list_subscriptions,
+            save_subscription,
+            delete_subscription,
+            mark_subscription_used,
             test_connection,
             test_server_egress,
             inspect_server,
             install_or_repair_mihomo,
             update_subscription,
             set_mihomo_service,
+            inspect_remote_proxy,
+            save_remote_proxy,
+            set_remote_proxy_enabled,
             open_controller_tunnel,
             close_controller_tunnel,
             list_proxy_groups,

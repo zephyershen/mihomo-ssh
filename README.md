@@ -4,7 +4,7 @@ Local Tauri desktop app for managing `mihomo` on headless Linux servers over SSH
 
 ## What is included
 
-- React + TypeScript desktop UI with server list, health, install, subscription, node switching, config preview, and logs.
+- React + TypeScript desktop UI with server list, health, install, subscription, node switching, remote proxy environment, config preview, and logs.
 - Tauri/Rust backend commands for Windows `ssh.exe`/`scp.exe`, SQLite persistence, systemd service control, mihomo installation, subscription update, and controller API access through an SSH tunnel.
 - Local redaction for subscription URLs, proxy node credentials, and SSH identity paths.
 
@@ -14,6 +14,11 @@ Local Tauri desktop app for managing `mihomo` on headless Linux servers over SSH
 npm install
 npm run check
 ```
+
+If you switch between Windows `cmd` and WSL, reinstall dependencies in the
+environment you are using. Native packages under `node_modules` are OS-specific,
+so a `node_modules` directory created by Windows can miss Linux packages, and the
+reverse can happen too.
 
 To run the desktop app you also need the Rust toolchain and Tauri system prerequisites:
 
@@ -69,5 +74,5 @@ The first updater-enabled release still has to be installed manually. Later rele
 - Windows native desktop runtime.
 - Servers are imported from the Windows SSH config.
 - Remote servers are Ubuntu/Debian with systemd and root SSH access.
-- Subscription URLs are stored only on the remote server at `/etc/mihomo/subscription.url`.
+- Subscription profiles are stored locally; the selected URL is written to the remote server at `/etc/mihomo/subscription.url`.
 - Remote TUN mode is intentionally out of scope for v1.

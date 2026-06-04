@@ -7,10 +7,14 @@ import type {
   OperationLog,
   ProxyGroup,
   ProxyNode,
+  RemoteProxyConfig,
+  RemoteProxyInput,
   Server,
   ServerBootstrapInput,
   ServerHealth,
   ServiceCommandResult,
+  SubscriptionInput,
+  SubscriptionProfile,
   TunnelInfo,
 } from "../types";
 
@@ -33,6 +37,13 @@ export const api = {
   deleteServer: (serverId: number) => call<Server[]>("delete_server", { serverId }),
   listOperationLogs: (serverId?: number, limit = 120) =>
     call<OperationLog[]>("list_operation_logs", { serverId, limit }),
+  listSubscriptions: () => call<SubscriptionProfile[]>("list_subscriptions"),
+  saveSubscription: (input: SubscriptionInput) =>
+    call<SubscriptionProfile>("save_subscription", { input }),
+  deleteSubscription: (subscriptionId: number) =>
+    call<SubscriptionProfile[]>("delete_subscription", { subscriptionId }),
+  markSubscriptionUsed: (subscriptionId: number) =>
+    call<SubscriptionProfile>("mark_subscription_used", { subscriptionId }),
   testConnection: (serverId: number) => call<CommandResult>("test_connection", { serverId }),
   testServerEgress: (serverId: number, url: string) =>
     call<EgressTestResult>("test_server_egress", { serverId, url }),
@@ -49,6 +60,12 @@ export const api = {
     }),
   setMihomoService: (serverId: number, serviceState: string) =>
     call<ServiceCommandResult>("set_mihomo_service", { serverId, serviceState }),
+  inspectRemoteProxy: (serverId: number) =>
+    call<RemoteProxyConfig>("inspect_remote_proxy", { serverId }),
+  saveRemoteProxy: (serverId: number, input: RemoteProxyInput) =>
+    call<CommandResult>("save_remote_proxy", { serverId, input }),
+  setRemoteProxyEnabled: (serverId: number, enabled: boolean) =>
+    call<CommandResult>("set_remote_proxy_enabled", { serverId, enabled }),
   openControllerTunnel: (serverId: number) =>
     call<TunnelInfo>("open_controller_tunnel", { serverId }),
   closeControllerTunnel: (serverId: number) =>
@@ -63,6 +80,41 @@ export const api = {
   readMihomoLogs: (serverId: number, lines = 200) =>
     call<string>("read_mihomo_logs", { serverId, lines }),
   readMihomoConfig: (serverId: number) => call<string>("read_mihomo_config", { serverId }),
+};
+
+let mockSubscriptions: SubscriptionProfile[] = [
+  {
+    id: 1,
+    name: "Cyber Paws",
+    url: "https://example.com/sub?token=cyber-paws",
+    createdAt: new Date(Date.now() - 1000 * 60 * 60 * 26).toISOString(),
+    updatedAt: new Date(Date.now() - 1000 * 60 * 60).toISOString(),
+    lastUsedAt: new Date(Date.now() - 1000 * 60 * 60).toISOString(),
+  },
+  {
+    id: 2,
+    name: "HENET",
+    url: "https://getinfo.bigwater.example/subscription",
+    createdAt: new Date(Date.now() - 1000 * 60 * 60 * 72).toISOString(),
+    updatedAt: new Date(Date.now() - 1000 * 60 * 36).toISOString(),
+    lastUsedAt: null,
+  },
+];
+
+let mockRemoteProxy: RemoteProxyConfig = {
+  enabled: true,
+  managed: true,
+  profilePath: "/etc/profile.d/mihomo-manager-proxy.sh",
+  httpProxy: "http://127.0.0.1:7890",
+  httpsProxy: "http://127.0.0.1:7890",
+  allProxy: "socks5h://127.0.0.1:7890",
+  noProxy: "localhost,127.0.0.1,::1,10.40.2.0/24",
+  detectedEnv: [
+    { name: "http_proxy", value: "http://127.0.0.1:7890" },
+    { name: "HTTPS_PROXY", value: "http://127.0.0.1:7890" },
+    { name: "ALL_PROXY", value: "socks5h://127.0.0.1:7890" },
+    { name: "no_proxy", value: "localhost,127.0.0.1,::1,10.40.2.0/24" },
+  ],
 };
 
 async function mockInvoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
@@ -142,6 +194,30 @@ async function mockInvoke<T>(command: string, args?: Record<string, unknown>): P
       return result as T;
     case "set_mihomo_service":
       return { state: args?.serviceState ?? "start", output: result } as T;
+    case "inspect_remote_proxy":
+      return mockRemoteProxy as T;
+    case "save_remote_proxy": {
+      const input = args?.input as RemoteProxyInput | undefined;
+      mockRemoteProxy = remoteProxyFromInput(input ?? remoteProxyInputFromConfig(mockRemoteProxy));
+      return {
+        ok: true,
+        code: 0,
+        stdout: `remote proxy ${mockRemoteProxy.enabled ? "enabled" : "disabled"}\nprofile: ${mockRemoteProxy.profilePath}\n`,
+        stderr: "",
+      } as T;
+    }
+    case "set_remote_proxy_enabled": {
+      mockRemoteProxy = remoteProxyFromInput({
+        ...remoteProxyInputFromConfig(mockRemoteProxy),
+        enabled: Boolean(args?.enabled),
+      });
+      return {
+        ok: true,
+        code: 0,
+        stdout: `remote proxy ${mockRemoteProxy.enabled ? "enabled" : "disabled"}\n`,
+        stderr: "",
+      } as T;
+    }
     case "open_controller_tunnel":
       return { serverId: args?.serverId ?? 1, localPort: 19090, status: "open" } as T;
     case "close_controller_tunnel":
@@ -186,7 +262,76 @@ async function mockInvoke<T>(command: string, args?: Record<string, unknown>): P
           createdAt: new Date().toISOString(),
         },
       ] as T;
+    case "list_subscriptions":
+      return mockSubscriptions as T;
+    case "save_subscription": {
+      const input = args?.input as SubscriptionInput | undefined;
+      const now = new Date().toISOString();
+      const id = input?.id ?? Math.max(0, ...mockSubscriptions.map((item) => item.id)) + 1;
+      const url = input?.url.trim() || "https://example.com/sub";
+      const name = input?.name?.trim() || subscriptionNameFromUrl(url);
+      const existing = mockSubscriptions.find((item) => item.id === id);
+      const saved: SubscriptionProfile = {
+        id,
+        name,
+        url,
+        createdAt: existing?.createdAt ?? now,
+        updatedAt: now,
+        lastUsedAt: existing?.lastUsedAt ?? null,
+      };
+      mockSubscriptions = [saved, ...mockSubscriptions.filter((item) => item.id !== id)];
+      return saved as T;
+    }
+    case "delete_subscription":
+      mockSubscriptions = mockSubscriptions.filter((item) => item.id !== args?.subscriptionId);
+      return mockSubscriptions as T;
+    case "mark_subscription_used": {
+      const now = new Date().toISOString();
+      mockSubscriptions = mockSubscriptions.map((item) =>
+        item.id === args?.subscriptionId ? { ...item, updatedAt: now, lastUsedAt: now } : item,
+      );
+      return mockSubscriptions.find((item) => item.id === args?.subscriptionId) as T;
+    }
     default:
       throw new Error(`mock command not implemented: ${command}`);
   }
+}
+
+function subscriptionNameFromUrl(url: string): string {
+  try {
+    return new URL(url).hostname.replace(/^www\./, "") || "Subscription";
+  } catch {
+    return "Subscription";
+  }
+}
+
+function remoteProxyInputFromConfig(config: RemoteProxyConfig): RemoteProxyInput {
+  return {
+    enabled: config.enabled,
+    httpProxy: config.httpProxy ?? "",
+    httpsProxy: config.httpsProxy ?? "",
+    allProxy: config.allProxy ?? "",
+    noProxy: config.noProxy ?? "",
+  };
+}
+
+function remoteProxyFromInput(input: RemoteProxyInput): RemoteProxyConfig {
+  const detectedEnv = input.enabled
+    ? [
+        { name: "http_proxy", value: input.httpProxy },
+        { name: "https_proxy", value: input.httpsProxy },
+        { name: "all_proxy", value: input.allProxy },
+        { name: "no_proxy", value: input.noProxy },
+      ].filter((item) => item.value)
+    : [];
+  return {
+    enabled: input.enabled,
+    managed: true,
+    profilePath: "/etc/profile.d/mihomo-manager-proxy.sh",
+    httpProxy: input.httpProxy,
+    httpsProxy: input.httpsProxy,
+    allProxy: input.allProxy,
+    noProxy: input.noProxy,
+    detectedEnv,
+  };
 }

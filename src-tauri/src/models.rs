@@ -88,6 +88,55 @@ pub struct OperationLog {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct SubscriptionProfile {
+    pub id: i64,
+    pub name: String,
+    pub url: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub last_used_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubscriptionInput {
+    pub id: Option<i64>,
+    pub name: Option<String>,
+    pub url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProxyEnvVar {
+    pub name: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProxyConfig {
+    pub enabled: bool,
+    pub managed: bool,
+    pub profile_path: String,
+    pub http_proxy: Option<String>,
+    pub https_proxy: Option<String>,
+    pub all_proxy: Option<String>,
+    pub no_proxy: Option<String>,
+    pub detected_env: Vec<RemoteProxyEnvVar>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProxyInput {
+    pub enabled: bool,
+    pub http_proxy: String,
+    pub https_proxy: String,
+    pub all_proxy: String,
+    pub no_proxy: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CommandResult {
     pub ok: bool,
     pub code: Option<i32>,
