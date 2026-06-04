@@ -240,7 +240,7 @@ export function App() {
       ...manualServerInput(),
       password: serverDraft.password,
     };
-    await run("初始化 SSH key", () => api.bootstrapServerWithPassword(input), (next) => {
+    await run("安装 SSH key", () => api.bootstrapServerWithPassword(input), (next) => {
       setServers(next);
       selectAddedServer(next, input);
       setShowAddServer(false);
@@ -625,31 +625,34 @@ function AddServerPanel(props: {
         </label>
       </div>
       <label className="field-label">
-        <span>Password</span>
+        <span>SSH Password</span>
         <input
           type="password"
           value={props.draft.password}
           autoComplete="off"
-          placeholder="one-time"
+          placeholder="server login password"
+          title="Only used to install the app public key on this server. It is not saved."
           onChange={(event) => props.onChange("password", event.target.value)}
         />
       </label>
-      <div className="key-chip" title={props.keyInfo?.privateKeyHint ?? "managed SSH key"}>
+      <div className="key-chip" title={props.keyInfo?.privateKeyHint ?? "App-managed SSH key"}>
         <KeyRound size={14} />
-        <span>{props.keyInfo?.privateKeyHint ?? "managed key"}</span>
+        <span>{props.keyInfo?.privateKeyHint ?? "app SSH key"}</span>
       </div>
       <div className="button-row">
         <button
           className="command-button primary compact-button"
           disabled={!!props.busy || !props.draft.hostName || !props.draft.user || !props.draft.password}
+          title="Use the current SSH password once to install the app public key, then save this server."
           onClick={props.onBootstrap}
         >
           <KeyRound size={15} />
-          Bootstrap
+          Install Key
         </button>
         <button
           className="command-button compact-button"
           disabled={!!props.busy || !props.draft.hostName || !props.draft.user}
+          title="Save this server when the app public key is already allowed on the server."
           onClick={props.onAdd}
         >
           <Plus size={15} />
