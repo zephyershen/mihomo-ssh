@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
+  BackupSnapshot,
   CommandResult,
   EgressTestResult,
   ManagedSshKeyInfo,
@@ -37,6 +38,13 @@ export const api = {
   deleteServer: (serverId: number) => call<Server[]>("delete_server", { serverId }),
   listOperationLogs: (serverId?: number, limit = 120) =>
     call<OperationLog[]>("list_operation_logs", { serverId, limit }),
+  listBackups: (serverId: number) => call<BackupSnapshot[]>("list_backups", { serverId }),
+  createBackup: (serverId: number, label?: string) =>
+    call<BackupSnapshot>("create_backup", { serverId, label: label || null }),
+  restoreBackup: (serverId: number, backupId: number) =>
+    call<CommandResult>("restore_backup", { serverId, backupId }),
+  deleteBackup: (serverId: number, backupId: number) =>
+    call<CommandResult>("delete_backup", { serverId, backupId }),
   listSubscriptions: () => call<SubscriptionProfile[]>("list_subscriptions"),
   saveSubscription: (input: SubscriptionInput) =>
     call<SubscriptionProfile>("save_subscription", { input }),
@@ -116,6 +124,44 @@ let mockRemoteProxy: RemoteProxyConfig = {
     { name: "no_proxy", value: "localhost,127.0.0.1,::1,10.40.2.0/24" },
   ],
 };
+
+let mockBackups: BackupSnapshot[] = [
+  {
+    id: 1,
+    serverId: 1,
+    reason: "update_subscription",
+    label: "更新订阅前",
+    remoteDir: "/etc/mihomo/manager-backups/20260611123000000-update-subscription",
+    status: "ok",
+    createdAt: new Date(Date.now() - 1000 * 60 * 30).toISOString(),
+    files: [
+      {
+        kind: "config",
+        remotePath: "/etc/mihomo/config.yaml",
+        backupFile: "config.yaml",
+        present: true,
+        sizeBytes: 4096,
+        sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      },
+      {
+        kind: "subscription",
+        remotePath: "/etc/mihomo/subscription.url",
+        backupFile: "subscription.url",
+        present: true,
+        sizeBytes: 80,
+        sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      },
+      {
+        kind: "remote_proxy",
+        remotePath: "/etc/profile.d/mihomo-manager-proxy.sh",
+        backupFile: "mihomo-manager-proxy.sh",
+        present: true,
+        sizeBytes: 320,
+        sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      },
+    ],
+  },
+];
 
 async function mockInvoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
   await new Promise((resolve) => window.setTimeout(resolve, 220));
@@ -262,6 +308,29 @@ async function mockInvoke<T>(command: string, args?: Record<string, unknown>): P
           createdAt: new Date().toISOString(),
         },
       ] as T;
+    case "list_backups":
+      return mockBackups.filter((backup) => backup.serverId === args?.serverId) as T;
+    case "create_backup": {
+      const now = new Date().toISOString();
+      const id = Math.max(0, ...mockBackups.map((backup) => backup.id)) + 1;
+      const snapshot: BackupSnapshot = {
+        id,
+        serverId: Number(args?.serverId ?? 1),
+        reason: "manual",
+        label: typeof args?.label === "string" ? args.label : "手动备份",
+        remoteDir: `/etc/mihomo/manager-backups/mock-${id}-manual`,
+        status: "ok",
+        createdAt: now,
+        files: mockBackups[0]?.files ?? [],
+      };
+      mockBackups = [snapshot, ...mockBackups].slice(0, 20);
+      return snapshot as T;
+    }
+    case "restore_backup":
+      return { ok: true, code: 0, stdout: "restored backup", stderr: "" } as T;
+    case "delete_backup":
+      mockBackups = mockBackups.filter((backup) => backup.id !== args?.backupId);
+      return { ok: true, code: 0, stdout: "deleted backup", stderr: "" } as T;
     case "list_subscriptions":
       return mockSubscriptions as T;
     case "save_subscription": {

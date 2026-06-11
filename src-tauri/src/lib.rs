@@ -1,3 +1,4 @@
+mod backup;
 mod controller;
 mod mihomo;
 mod models;
@@ -9,9 +10,9 @@ mod storage;
 use std::{path::PathBuf, time::Duration};
 
 use models::{
-    CommandResult, EgressTestResult, InstallOptions, ManagedSshKeyInfo, ManualServerInput,
-    OperationLog, ProxyGroup, ProxyNode, RemoteProxyConfig, RemoteProxyInput, Server,
-    ServerBootstrapInput, ServerHealth, ServiceCommandResult, SubscriptionInput,
+    BackupSnapshot, CommandResult, EgressTestResult, InstallOptions, ManagedSshKeyInfo,
+    ManualServerInput, OperationLog, ProxyGroup, ProxyNode, RemoteProxyConfig, RemoteProxyInput,
+    Server, ServerBootstrapInput, ServerHealth, ServiceCommandResult, SubscriptionInput,
     SubscriptionProfile, SubscriptionUpdateOptions, TunnelInfo,
 };
 use reqwest::Url;
@@ -144,6 +145,81 @@ fn list_operation_logs(
     limit: Option<u32>,
 ) -> Result<Vec<OperationLog>, String> {
     state.storage.list_logs(server_id, limit.unwrap_or(120))
+}
+
+#[tauri::command]
+fn list_backups(state: State<'_, AppState>, server_id: i64) -> Result<Vec<BackupSnapshot>, String> {
+    state.storage.list_backup_snapshots(server_id)
+}
+
+#[tauri::command]
+async fn create_backup(
+    state: State<'_, AppState>,
+    server_id: i64,
+    label: Option<String>,
+) -> Result<BackupSnapshot, String> {
+    let storage = state.storage.clone();
+    let server = storage.get_server(server_id)?;
+    create_indexed_backup(storage, server, "manual".to_string(), label).await
+}
+
+#[tauri::command]
+async fn restore_backup(
+    state: State<'_, AppState>,
+    server_id: i64,
+    backup_id: i64,
+) -> Result<CommandResult, String> {
+    let storage = state.storage.clone();
+    let server = storage.get_server(server_id)?;
+    let snapshot = storage.get_backup_snapshot(server_id, backup_id)?;
+    create_indexed_backup(
+        storage.clone(),
+        server.clone(),
+        "pre_restore".to_string(),
+        Some(format!("回滚备份 {backup_id} 前")),
+    )
+    .await?;
+    let result = run_blocking({
+        let server = server.clone();
+        let snapshot = snapshot.clone();
+        move || backup::restore(&server, &snapshot)
+    })
+    .await?;
+    log_command(&storage, server_id, "restore_backup", &result)?;
+    Ok(result)
+}
+
+#[tauri::command]
+async fn delete_backup(
+    state: State<'_, AppState>,
+    server_id: i64,
+    backup_id: i64,
+) -> Result<CommandResult, String> {
+    let storage = state.storage.clone();
+    let server = storage.get_server(server_id)?;
+    let snapshot = storage.get_backup_snapshot(server_id, backup_id)?;
+    let result = match run_blocking({
+        let server = server.clone();
+        let remote_dir = snapshot.remote_dir.clone();
+        move || backup::delete_remote(&server, &remote_dir)
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(err) => CommandResult {
+            ok: false,
+            code: None,
+            stdout: String::new(),
+            stderr: err,
+        },
+    };
+    if result.ok {
+        storage.delete_backup_record(backup_id)?;
+    } else {
+        storage.update_backup_status(backup_id, "delete_failed")?;
+    }
+    log_command(&storage, server_id, "delete_backup", &result)?;
+    Ok(result)
 }
 
 #[tauri::command]
@@ -302,6 +378,13 @@ async fn install_or_repair_mihomo(
     let options = normalize_install_options(options.unwrap_or(InstallOptions {
         subscription_url: None,
     }))?;
+    create_indexed_backup(
+        state.storage.clone(),
+        server.clone(),
+        "install".to_string(),
+        Some("安装或修复前".to_string()),
+    )
+    .await?;
     let result = mihomo::install_or_repair(&server, options).await?;
     log_command(
         &state.storage,
@@ -323,6 +406,13 @@ async fn update_subscription(
         normalize_subscription_update_options(options.unwrap_or(SubscriptionUpdateOptions {
             subscription_url: None,
         }))?;
+    create_indexed_backup(
+        state.storage.clone(),
+        server.clone(),
+        "update_subscription".to_string(),
+        Some("更新订阅前".to_string()),
+    )
+    .await?;
     let result = mihomo::update_subscription(&server, options).await?;
     log_command(&state.storage, server_id, "update_subscription", &result)?;
     Ok(result)
@@ -373,6 +463,12 @@ async fn save_remote_proxy(
     let storage = state.storage.clone();
     run_blocking(move || {
         let server = storage.get_server(server_id)?;
+        create_indexed_backup_sync(
+            &storage,
+            &server,
+            "save_remote_proxy",
+            Some("保存远端代理前"),
+        )?;
         let result = remote_proxy::save(&server, input)?;
         log_command(&storage, server_id, "save_remote_proxy", &result)?;
         Ok(result)
@@ -389,6 +485,12 @@ async fn set_remote_proxy_enabled(
     let storage = state.storage.clone();
     run_blocking(move || {
         let server = storage.get_server(server_id)?;
+        create_indexed_backup_sync(
+            &storage,
+            &server,
+            "toggle_remote_proxy",
+            Some("切换远端代理前"),
+        )?;
         let result = remote_proxy::set_enabled(&server, enabled)?;
         log_command(
             &storage,
@@ -559,6 +661,70 @@ fn log_command(
 ) -> Result<(), String> {
     let status = if result.ok { "ok" } else { "error" };
     storage.add_log(Some(server_id), action, status, &command_summary(result))
+}
+
+async fn create_indexed_backup(
+    storage: Storage,
+    server: Server,
+    reason: String,
+    label: Option<String>,
+) -> Result<BackupSnapshot, String> {
+    run_blocking(move || create_indexed_backup_sync(&storage, &server, &reason, label.as_deref()))
+        .await
+}
+
+fn create_indexed_backup_sync(
+    storage: &Storage,
+    server: &Server,
+    reason: &str,
+    label: Option<&str>,
+) -> Result<BackupSnapshot, String> {
+    let remote = backup::create(server, reason)?;
+    let snapshot = storage.insert_backup_snapshot(
+        server.id,
+        reason,
+        label,
+        &remote.remote_dir,
+        &remote.files,
+    )?;
+    storage.add_log(
+        Some(server.id),
+        "create_backup",
+        "ok",
+        &format!(
+            "{} {}",
+            reason,
+            snapshot.label.as_deref().unwrap_or(&snapshot.remote_dir)
+        ),
+    )?;
+    prune_backup_retention(storage, server)?;
+    Ok(snapshot)
+}
+
+fn prune_backup_retention(storage: &Storage, server: &Server) -> Result<(), String> {
+    let snapshots = storage.list_backup_snapshots(server.id)?;
+    for snapshot in snapshots.into_iter().skip(20) {
+        let result = backup::delete_remote(server, &snapshot.remote_dir).unwrap_or_else(|err| {
+            CommandResult {
+                ok: false,
+                code: None,
+                stdout: String::new(),
+                stderr: err,
+            }
+        });
+        if result.ok {
+            storage.delete_backup_record(snapshot.id)?;
+            continue;
+        }
+        storage.update_backup_status(snapshot.id, "delete_failed")?;
+        storage.add_log(
+            Some(server.id),
+            "prune_backup",
+            "error",
+            &command_summary(&result),
+        )?;
+    }
+    Ok(())
 }
 
 async fn run_blocking<T, F>(operation: F) -> Result<T, String>
@@ -789,6 +955,10 @@ pub fn run() {
             bootstrap_server_with_password,
             delete_server,
             list_operation_logs,
+            list_backups,
+            create_backup,
+            restore_backup,
+            delete_backup,
             list_subscriptions,
             save_subscription,
             delete_subscription,

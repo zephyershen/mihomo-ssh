@@ -8,6 +8,7 @@ import {
   Gauge,
   Globe,
   GripVertical,
+  History,
   KeyRound,
   Loader2,
   Network,
@@ -36,6 +37,7 @@ import {
   type AppUpdateStatus,
 } from "./lib/updater";
 import type {
+  BackupSnapshot,
   CommandResult,
   EgressTestResult,
   ManagedSshKeyInfo,
@@ -52,7 +54,7 @@ import type {
   SubscriptionProfile,
 } from "./types";
 
-type Tab = "overview" | "install" | "subscription" | "nodes" | "config" | "logs" | "updates";
+type Tab = "overview" | "install" | "subscription" | "nodes" | "config" | "backup" | "logs" | "updates";
 type ServerDraft = {
   displayName: string;
   hostName: string;
@@ -86,6 +88,7 @@ const tabs: Array<{ id: Tab; label: string; icon: typeof Activity }> = [
   { id: "subscription", label: "订阅", icon: UploadCloud },
   { id: "nodes", label: "节点", icon: Network },
   { id: "config", label: "配置", icon: Settings },
+  { id: "backup", label: "备份", icon: History },
   { id: "logs", label: "日志", icon: TerminalSquare },
   { id: "updates", label: "更新", icon: Download },
 ];
@@ -118,6 +121,7 @@ export function App() {
   const [remoteProxy, setRemoteProxy] = useState<RemoteProxyConfig | null>(null);
   const [remoteProxyDraft, setRemoteProxyDraft] =
     useState<RemoteProxyInput>(defaultRemoteProxyInput);
+  const [backups, setBackups] = useState<BackupSnapshot[]>([]);
   const [operationLogs, setOperationLogs] = useState<OperationLog[]>([]);
   const [updateStatus, setUpdateStatus] = useState<AppUpdateStatus | null>(null);
   const [updateProgress, setUpdateProgress] = useState<AppUpdateProgress>({
@@ -168,6 +172,7 @@ export function App() {
       setEgressResult(null);
       setRemoteProxy(null);
       setRemoteProxyDraft(defaultRemoteProxyInput);
+      setBackups([]);
       return;
     }
     setHealth(null);
@@ -177,6 +182,7 @@ export function App() {
     setEgressResult(null);
     setRemoteProxy(null);
     setRemoteProxyDraft(defaultRemoteProxyInput);
+    setBackups([]);
     void refreshHealth(selectedId);
     void refreshOperationLogs();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -191,6 +197,14 @@ export function App() {
       return;
     }
     void refreshRemoteProxy(selectedId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTab, selectedId]);
+
+  useEffect(() => {
+    if (activeTab !== "backup" || !selectedId) {
+      return;
+    }
+    void refreshBackups(selectedId);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeTab, selectedId]);
 
@@ -255,6 +269,14 @@ export function App() {
     }
   }
 
+  async function refreshBackups(id = selectedId) {
+    if (!id) return;
+    const next = await run("读取备份", () => api.listBackups(id));
+    if (next && selectedIdRef.current === id) {
+      setBackups(next);
+    }
+  }
+
   async function command(label: string, work: () => Promise<CommandResult>): Promise<CommandResult | undefined> {
     const result = await run(label, work);
     if (result) {
@@ -276,6 +298,7 @@ export function App() {
     );
     if (result?.ok) {
       void refreshRemoteProxy(selected.id);
+      void refreshBackups(selected.id);
     }
   }
 
@@ -286,6 +309,7 @@ export function App() {
     );
     if (result?.ok) {
       void refreshRemoteProxy(selected.id);
+      void refreshBackups(selected.id);
     }
   }
 
@@ -443,6 +467,7 @@ export function App() {
     const result = await command("更新订阅", () => api.updateSubscription(selected.id, profile.url));
     if (result?.ok) {
       void markSubscriptionUsed(profile.id);
+      void refreshBackups(selected.id);
     }
   }
 
@@ -452,6 +477,7 @@ export function App() {
     const result = await command("更新订阅", () => api.updateSubscription(selected.id, profile.url));
     if (result?.ok) {
       void markSubscriptionUsed(profile.id);
+      void refreshBackups(selected.id);
     }
   }
 
@@ -463,6 +489,9 @@ export function App() {
     );
     if (result?.ok && subscriptionDraft.id) {
       void markSubscriptionUsed(subscriptionDraft.id);
+    }
+    if (result?.ok) {
+      void refreshBackups(selected.id);
     }
   }
 
@@ -479,6 +508,41 @@ export function App() {
       setSelectedSubscriptionId(replacement?.id ?? null);
       setSubscriptionDraft(replacement ? draftFromSubscription(replacement) : emptySubscriptionDraft);
     });
+  }
+
+  async function createManualBackup() {
+    if (!selected) return;
+    const label = `手动备份 ${formatShortTime(new Date().toISOString())}`;
+    await run("创建备份", () => api.createBackup(selected.id, label), (snapshot) => {
+      setBackups((current) => [snapshot, ...current.filter((item) => item.id !== snapshot.id)]);
+      setToast(`创建备份: ${snapshot.label ?? snapshot.remoteDir}`);
+      void refreshOperationLogs();
+    });
+  }
+
+  async function restoreBackup(snapshot: BackupSnapshot) {
+    if (!selected) return;
+    const confirmed = window.confirm(
+      `回滚到备份 "${snapshot.label ?? snapshot.remoteDir}"？这会覆盖远端当前关键配置。`,
+    );
+    if (!confirmed) return;
+    const result = await command("回滚备份", () => api.restoreBackup(selected.id, snapshot.id));
+    if (result?.ok) {
+      void refreshBackups(selected.id);
+      void refreshHealth(selected.id);
+    }
+  }
+
+  async function deleteBackupSnapshot(snapshot: BackupSnapshot) {
+    if (!selected) return;
+    const confirmed = window.confirm(`删除备份 "${snapshot.label ?? snapshot.remoteDir}"？`);
+    if (!confirmed) return;
+    const result = await command("删除备份", () => api.deleteBackup(selected.id, snapshot.id));
+    if (result?.ok) {
+      setBackups((current) => current.filter((item) => item.id !== snapshot.id));
+    } else {
+      void refreshBackups(selected.id);
+    }
   }
 
   async function testEgress() {
@@ -798,6 +862,18 @@ export function App() {
               onProxySave={saveRemoteProxyDraft}
               onProxyEnable={() => setRemoteProxyState(true)}
               onProxyDisable={() => setRemoteProxyState(false)}
+            />
+          )}
+
+          {activeTab === "backup" && (
+            <BackupPanel
+              selected={selected}
+              busy={busy}
+              backups={backups}
+              onCreate={createManualBackup}
+              onRefresh={() => refreshBackups()}
+              onRestore={restoreBackup}
+              onDelete={deleteBackupSnapshot}
             />
           )}
 
@@ -1520,6 +1596,89 @@ function RemoteProxyPanel(props: {
   );
 }
 
+function BackupPanel(props: {
+  selected: Server | null;
+  busy: string | null;
+  backups: BackupSnapshot[];
+  onCreate: () => void;
+  onRefresh: () => void;
+  onRestore: (snapshot: BackupSnapshot) => void;
+  onDelete: (snapshot: BackupSnapshot) => void;
+}) {
+  return (
+    <div className="backup-layout">
+      <div className="work-panel">
+        <div className="section-heading">
+          <div>
+            <div className="panel-title">备份</div>
+            <div className="proxy-status">{props.backups.length} 个备份</div>
+          </div>
+          <div className="button-row">
+            <button className="command-button primary" disabled={!props.selected || !!props.busy} onClick={props.onCreate}>
+              <Plus size={17} />
+              创建备份
+            </button>
+            <button className="command-button" disabled={!props.selected || !!props.busy} onClick={props.onRefresh}>
+              <RefreshCcw size={17} />
+              刷新
+            </button>
+          </div>
+        </div>
+
+        <div className="backup-list">
+          {props.backups.map((snapshot) => (
+            <div key={snapshot.id} className={`backup-row ${snapshot.status}`}>
+              <div className="backup-main">
+                <div className="backup-title-line">
+                  <strong title={snapshot.label ?? snapshot.remoteDir}>
+                    {snapshot.label ?? backupReasonLabel(snapshot.reason)}
+                  </strong>
+                  <span className={`op-status ${snapshot.status}`}>{snapshot.status}</span>
+                </div>
+                <div className="backup-meta">
+                  <span>{backupReasonLabel(snapshot.reason)}</span>
+                  <time>{formatFullTime(snapshot.createdAt)}</time>
+                  <span title={snapshot.remoteDir}>{snapshot.remoteDir}</span>
+                </div>
+                <div className="backup-files">
+                  {snapshot.files.map((file) => (
+                    <span
+                      key={`${snapshot.id}:${file.kind}`}
+                      className={`backup-file-chip ${file.present ? "present" : "missing"}`}
+                      title={`${file.remotePath}${file.present && file.sizeBytes != null ? ` · ${formatBytes(file.sizeBytes)}` : ""}`}
+                    >
+                      {backupFileLabel(file.kind)}
+                    </span>
+                  ))}
+                </div>
+              </div>
+              <div className="backup-actions">
+                <button
+                  className="icon-button small"
+                  title="回滚"
+                  disabled={!props.selected || !!props.busy || snapshot.status !== "ok"}
+                  onClick={() => props.onRestore(snapshot)}
+                >
+                  <RotateCw size={15} />
+                </button>
+                <button
+                  className="icon-button small danger-icon"
+                  title="删除"
+                  disabled={!props.selected || !!props.busy}
+                  onClick={() => props.onDelete(snapshot)}
+                >
+                  <Trash2 size={15} />
+                </button>
+              </div>
+            </div>
+          ))}
+          {!props.backups.length && <div className="empty-table">暂无备份</div>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function LogsPanel(props: {
   selected: Server | null;
   busy: string | null;
@@ -1655,6 +1814,33 @@ function subscriptionHost(url: string): string {
   } catch {
     return "invalid url";
   }
+}
+
+function backupReasonLabel(reason: string): string {
+  const labels: Record<string, string> = {
+    manual: "手动",
+    install: "安装前",
+    update_subscription: "订阅前",
+    save_remote_proxy: "代理保存前",
+    toggle_remote_proxy: "代理切换前",
+    pre_restore: "回滚前",
+  };
+  return labels[reason] ?? reason;
+}
+
+function backupFileLabel(kind: string): string {
+  const labels: Record<string, string> = {
+    config: "config",
+    subscription: "subscription",
+    remote_proxy: "proxy",
+  };
+  return labels[kind] ?? kind;
+}
+
+function formatBytes(value: number): string {
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KiB`;
+  return `${(value / 1024 / 1024).toFixed(1)} MiB`;
 }
 
 function formatShortTime(value?: string | null): string {

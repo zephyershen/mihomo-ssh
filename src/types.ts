@@ -96,6 +96,26 @@ export type OperationLog = {
   createdAt: string;
 };
 
+export type BackupFile = {
+  kind: string;
+  remotePath: string;
+  backupFile: string;
+  present: boolean;
+  sizeBytes?: number | null;
+  sha256?: string | null;
+};
+
+export type BackupSnapshot = {
+  id: number;
+  serverId: number;
+  reason: string;
+  label?: string | null;
+  remoteDir: string;
+  files: BackupFile[];
+  status: string;
+  createdAt: string;
+};
+
 export type SubscriptionProfile = {
   id: number;
   name: string;

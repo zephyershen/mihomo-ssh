@@ -4,7 +4,8 @@ use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::models::{
-    ImportedHost, ManualServerInput, OperationLog, Server, SubscriptionInput, SubscriptionProfile,
+    BackupFile, BackupSnapshot, ImportedHost, ManualServerInput, OperationLog, Server,
+    SubscriptionInput, SubscriptionProfile,
 };
 
 #[derive(Debug, Clone)]
@@ -75,8 +76,22 @@ impl Storage {
               last_used_at TEXT
             );
 
+            CREATE TABLE IF NOT EXISTS backup_snapshots (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              server_id INTEGER NOT NULL,
+              reason TEXT NOT NULL,
+              label TEXT,
+              remote_dir TEXT NOT NULL UNIQUE,
+              files_json TEXT NOT NULL,
+              status TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              FOREIGN KEY(server_id) REFERENCES servers(id) ON DELETE CASCADE
+            );
+
             CREATE INDEX IF NOT EXISTS idx_operation_logs_server_id_id
               ON operation_logs(server_id, id DESC);
+            CREATE INDEX IF NOT EXISTS idx_backup_snapshots_server_id_id
+              ON backup_snapshots(server_id, id DESC);
             "#,
         )
         .map_err(|err| err.to_string())?;
@@ -350,6 +365,89 @@ impl Storage {
         self.get_subscription(subscription_id)
     }
 
+    pub fn insert_backup_snapshot(
+        &self,
+        server_id: i64,
+        reason: &str,
+        label: Option<&str>,
+        remote_dir: &str,
+        files: &[BackupFile],
+    ) -> Result<BackupSnapshot, String> {
+        let conn = self.connect()?;
+        let now = Utc::now().to_rfc3339();
+        let files_json = serde_json::to_string(files).map_err(|err| err.to_string())?;
+        conn.execute(
+            r#"
+            INSERT INTO backup_snapshots
+              (server_id, reason, label, remote_dir, files_json, status, created_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, 'ok', ?6)
+            "#,
+            params![server_id, reason, label, remote_dir, files_json, now],
+        )
+        .map_err(|err| err.to_string())?;
+        let id = conn.last_insert_rowid();
+        self.get_backup_snapshot(server_id, id)
+    }
+
+    pub fn list_backup_snapshots(&self, server_id: i64) -> Result<Vec<BackupSnapshot>, String> {
+        let conn = self.connect()?;
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT id, server_id, reason, label, remote_dir, files_json, status, created_at
+                FROM backup_snapshots
+                WHERE server_id = ?1
+                ORDER BY id DESC
+                "#,
+            )
+            .map_err(|err| err.to_string())?;
+        let rows = stmt
+            .query_map(params![server_id], backup_from_row)
+            .map_err(|err| err.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|err| err.to_string())
+    }
+
+    pub fn get_backup_snapshot(
+        &self,
+        server_id: i64,
+        backup_id: i64,
+    ) -> Result<BackupSnapshot, String> {
+        let conn = self.connect()?;
+        conn.query_row(
+            r#"
+            SELECT id, server_id, reason, label, remote_dir, files_json, status, created_at
+            FROM backup_snapshots
+            WHERE server_id = ?1 AND id = ?2
+            "#,
+            params![server_id, backup_id],
+            backup_from_row,
+        )
+        .optional()
+        .map_err(|err| err.to_string())?
+        .ok_or_else(|| format!("backup {backup_id} not found"))
+    }
+
+    pub fn update_backup_status(&self, backup_id: i64, status: &str) -> Result<(), String> {
+        let conn = self.connect()?;
+        conn.execute(
+            "UPDATE backup_snapshots SET status = ?1 WHERE id = ?2",
+            params![status, backup_id],
+        )
+        .map_err(|err| err.to_string())?;
+        Ok(())
+    }
+
+    pub fn delete_backup_record(&self, backup_id: i64) -> Result<(), String> {
+        let conn = self.connect()?;
+        conn.execute(
+            "DELETE FROM backup_snapshots WHERE id = ?1",
+            params![backup_id],
+        )
+        .map_err(|err| err.to_string())?;
+        Ok(())
+    }
+
     fn get_subscription_by_url(&self, url: &str) -> Result<SubscriptionProfile, String> {
         let conn = self.connect()?;
         conn.query_row(
@@ -488,6 +586,23 @@ fn log_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<OperationLog> {
         status: row.get(3)?,
         message: row.get(4)?,
         created_at: row.get(5)?,
+    })
+}
+
+fn backup_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<BackupSnapshot> {
+    let files_json: String = row.get(5)?;
+    let files = serde_json::from_str::<Vec<BackupFile>>(&files_json).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(err))
+    })?;
+    Ok(BackupSnapshot {
+        id: row.get(0)?,
+        server_id: row.get(1)?,
+        reason: row.get(2)?,
+        label: row.get(3)?,
+        remote_dir: row.get(4)?,
+        files,
+        status: row.get(6)?,
+        created_at: row.get(7)?,
     })
 }
 

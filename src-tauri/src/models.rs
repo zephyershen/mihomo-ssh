@@ -88,6 +88,30 @@ pub struct OperationLog {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct BackupFile {
+    pub kind: String,
+    pub remote_path: String,
+    pub backup_file: String,
+    pub present: bool,
+    pub size_bytes: Option<u64>,
+    pub sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackupSnapshot {
+    pub id: i64,
+    pub server_id: i64,
+    pub reason: String,
+    pub label: Option<String>,
+    pub remote_dir: String,
+    pub files: Vec<BackupFile>,
+    pub status: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SubscriptionProfile {
     pub id: i64,
     pub name: String,
