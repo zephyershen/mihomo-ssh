@@ -3,6 +3,7 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    thread,
     time::Duration,
 };
 
@@ -120,17 +121,6 @@ pub fn run_ssh_script(
     run_process(ssh_program(), &args, Some(script), timeout)
 }
 
-pub fn run_ssh_command(
-    server: &Server,
-    command: &str,
-    timeout: Duration,
-) -> Result<CommandResult, String> {
-    let mut args = base_ssh_args(server, true);
-    args.push(ssh_target(server));
-    args.push(command.to_string());
-    run_process(ssh_program(), &args, None, timeout)
-}
-
 pub fn scp_to_remote(
     server: &Server,
     local_path: &Path,
@@ -157,6 +147,8 @@ pub fn scp_from_remote(
 
 pub fn spawn_tunnel(server: &Server, local_port: u16) -> Result<std::process::Child, String> {
     let mut args = base_ssh_args(server, true);
+    args.push("-o".to_string());
+    args.push("ExitOnForwardFailure=yes".to_string());
     args.push("-N".to_string());
     args.push("-L".to_string());
     args.push(format!("127.0.0.1:{local_port}:127.0.0.1:9090"));
@@ -266,15 +258,6 @@ echo "managed SSH key installed"
         timeout,
         &input.password,
     )
-}
-
-fn read_pipe<T: Read>(pipe: &mut Option<T>) -> Result<String, String> {
-    let mut buffer = String::new();
-    if let Some(pipe) = pipe.as_mut() {
-        pipe.read_to_string(&mut buffer)
-            .map_err(|err| err.to_string())?;
-    }
-    Ok(buffer)
 }
 
 fn hidden_command(program: &str) -> Command {
@@ -420,6 +403,7 @@ fn run_process_with_askpass(
     password: &str,
 ) -> Result<CommandResult, String> {
     let temp = tempfile::tempdir().map_err(|err| err.to_string())?;
+    let password_file = create_password_file(temp.path(), password)?;
     let askpass = create_askpass_helper(temp.path())?;
     let envs = vec![
         (
@@ -428,7 +412,10 @@ fn run_process_with_askpass(
         ),
         ("SSH_ASKPASS_REQUIRE".to_string(), "force".to_string()),
         ("DISPLAY".to_string(), "mihomo-manager".to_string()),
-        ("MIHOMO_SSH_PASSWORD".to_string(), password.to_string()),
+        (
+            "MIHOMO_SSH_PASSWORD_FILE".to_string(),
+            password_file.to_string_lossy().to_string(),
+        ),
     ];
     run_process_with_env(program, args, input, timeout, &envs)
 }
@@ -476,8 +463,8 @@ fn run_process_from_command(
         .spawn()
         .map_err(|err| format!("{program} failed to start: {err}"))?;
 
-    let mut stdout = child.stdout.take();
-    let mut stderr = child.stderr.take();
+    let stdout = read_pipe_in_thread(child.stdout.take());
+    let stderr = read_pipe_in_thread(child.stderr.take());
 
     if let Some(input) = input {
         if let Some(mut stdin) = child.stdin.take() {
@@ -492,7 +479,8 @@ fn run_process_from_command(
         None => {
             let _ = child.kill();
             let _ = child.wait();
-            let stdout = read_pipe(&mut stdout)?;
+            let stdout = join_pipe_reader(stdout)?;
+            let _ = join_pipe_reader(stderr);
             return Ok(CommandResult {
                 ok: false,
                 code: None,
@@ -502,14 +490,34 @@ fn run_process_from_command(
         }
     };
 
-    let stdout = read_pipe(&mut stdout)?;
-    let stderr = read_pipe(&mut stderr)?;
+    let stdout = join_pipe_reader(stdout)?;
+    let stderr = join_pipe_reader(stderr)?;
     Ok(CommandResult {
         ok: status.success(),
         code: status.code(),
         stdout: redact(&stdout),
         stderr: redact(&stderr),
     })
+}
+
+fn read_pipe_in_thread<T>(pipe: Option<T>) -> thread::JoinHandle<Result<String, String>>
+where
+    T: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut buffer = String::new();
+        if let Some(mut pipe) = pipe {
+            pipe.read_to_string(&mut buffer)
+                .map_err(|err| err.to_string())?;
+        }
+        Ok(buffer)
+    })
+}
+
+fn join_pipe_reader(handle: thread::JoinHandle<Result<String, String>>) -> Result<String, String> {
+    handle
+        .join()
+        .map_err(|_| "process pipe reader panicked".to_string())?
 }
 
 fn create_askpass_helper(dir: &Path) -> Result<PathBuf, String> {
@@ -519,13 +527,20 @@ fn create_askpass_helper(dir: &Path) -> Result<PathBuf, String> {
         dir.join("mihomo-askpass.sh")
     };
     let body = if cfg!(windows) {
-        "@echo off\r\npowershell -NoProfile -ExecutionPolicy Bypass -Command \"[Console]::Out.Write($env:MIHOMO_SSH_PASSWORD)\"\r\n"
+        "@echo off\r\npowershell -NoProfile -ExecutionPolicy Bypass -Command \"[Console]::Out.Write([IO.File]::ReadAllText($env:MIHOMO_SSH_PASSWORD_FILE))\"\r\n"
     } else {
-        "#!/bin/sh\nprintf '%s' \"$MIHOMO_SSH_PASSWORD\"\n"
+        "#!/bin/sh\ncat \"$MIHOMO_SSH_PASSWORD_FILE\"\n"
     };
     fs::write(&helper, body).map_err(|err| err.to_string())?;
     set_executable_permissions(&helper)?;
     Ok(helper)
+}
+
+fn create_password_file(dir: &Path, password: &str) -> Result<PathBuf, String> {
+    let path = dir.join("mihomo-ssh-password");
+    fs::write(&path, password).map_err(|err| err.to_string())?;
+    set_private_key_permissions(&path)?;
+    Ok(path)
 }
 
 fn shell_quote(value: &str) -> String {

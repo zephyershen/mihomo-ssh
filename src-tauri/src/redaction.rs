@@ -86,7 +86,8 @@ mod tests {
 
     #[test]
     fn redacts_subscription_urls_and_identity_paths() {
-        let text = "curl https://example.com/sub?token=abc IdentityFile C:/Users/me/.ssh/id_ed25519";
+        let text =
+            "curl https://example.com/sub?token=abc IdentityFile C:/Users/me/.ssh/id_ed25519";
         let redacted = redact(text);
         assert!(redacted.contains("[redacted-url]"));
         assert!(redacted.contains("[redacted-path]"));
@@ -95,6 +96,9 @@ mod tests {
 
     #[test]
     fn keeps_only_identity_file_name_as_hint() {
-        assert_eq!(identity_hint(r"C:\Users\me\.ssh\codex_box_ed25519"), ".../codex_box_ed25519");
+        assert_eq!(
+            identity_hint(r"C:\Users\me\.ssh\codex_box_ed25519"),
+            ".../codex_box_ed25519"
+        );
     }
 }

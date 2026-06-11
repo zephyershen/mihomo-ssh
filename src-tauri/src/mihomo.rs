@@ -1,23 +1,28 @@
 use std::{
     fs::File,
-    io::{Read, Write},
-    path::Path,
+    io,
+    path::{Path, PathBuf},
     time::Duration,
 };
 
 use chrono::Utc;
 use flate2::read::GzDecoder;
 use serde::Deserialize;
-use serde_yaml::{Mapping, Number, Value};
+use sha2::{Digest, Sha256};
 use tempfile::tempdir;
+use yaml_serde::{Mapping, Number, Value};
 
 use crate::{
-    models::{CommandResult, InstallOptions, Server, ServerHealth, ServiceCommandResult, SubscriptionUpdateOptions},
+    models::{
+        CommandResult, InstallOptions, Server, ServerHealth, ServiceCommandResult,
+        SubscriptionUpdateOptions,
+    },
     ssh,
 };
 
 const MIHOMO_RELEASE_API: &str = "https://api.github.com/repos/MetaCubeX/mihomo/releases/latest";
 const REMOTE_TMP_DIR: &str = "/tmp/mihomo-manager";
+const MAX_MIHOMO_ARCHIVE_BYTES: u64 = 80 * 1024 * 1024;
 
 pub async fn inspect_server(server: &Server) -> Result<ServerHealth, String> {
     let script = r#"
@@ -46,7 +51,8 @@ if [ -f /etc/mihomo/config.yaml ]; then
 fi
 "#;
 
-    let output = ssh::run_ssh_script(server, script, Duration::from_secs(20))?;
+    let output =
+        run_ssh_script_blocking(server, script.to_string(), Duration::from_secs(20)).await?;
     if !output.ok {
         return Err(format!("inspect failed: {}", output.stderr));
     }
@@ -55,11 +61,13 @@ fi
 }
 
 pub async fn read_remote_config(server: &Server) -> Result<String, String> {
-    let output = ssh::run_ssh_script(
+    let output = run_ssh_script_blocking(
         server,
-        "test -f /etc/mihomo/config.yaml && sed -n '1,260p' /etc/mihomo/config.yaml || true",
+        "test -f /etc/mihomo/config.yaml && sed -n '1,260p' /etc/mihomo/config.yaml || true"
+            .to_string(),
         Duration::from_secs(20),
-    )?;
+    )
+    .await?;
     if output.ok {
         Ok(output.stdout)
     } else {
@@ -67,10 +75,17 @@ pub async fn read_remote_config(server: &Server) -> Result<String, String> {
     }
 }
 
-pub async fn install_or_repair(server: &Server, options: InstallOptions) -> Result<CommandResult, String> {
+pub async fn install_or_repair(
+    server: &Server,
+    options: InstallOptions,
+) -> Result<CommandResult, String> {
     let health = inspect_server(server).await?;
     let arch = health.arch.unwrap_or_else(|| "x86_64".to_string());
-    let asset = latest_asset_for_arch(&arch).await?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(120))
+        .build()
+        .map_err(|err| err.to_string())?;
+    let asset = latest_asset_for_arch(&client, &arch).await?;
     let should_update_subscription = options
         .subscription_url
         .as_deref()
@@ -80,24 +95,26 @@ pub async fn install_or_repair(server: &Server, options: InstallOptions) -> Resu
     let dir = tempdir().map_err(|err| err.to_string())?;
     let archive_path = dir.path().join("mihomo.gz");
     let binary_path = dir.path().join("mihomo");
-    download_asset(&asset.browser_download_url, &archive_path).await?;
-    decompress_gzip(&archive_path, &binary_path)?;
+    download_asset(&client, &asset, &archive_path).await?;
+    decompress_gzip_blocking(archive_path.clone(), binary_path.clone()).await?;
 
-    let prep = ssh::run_ssh_script(
+    let prep = run_ssh_script_blocking(
         server,
-        &format!("set -euo pipefail\ninstall -d -m 0700 {REMOTE_TMP_DIR}"),
+        format!("set -euo pipefail\ninstall -d -m 0700 {REMOTE_TMP_DIR}"),
         Duration::from_secs(20),
-    )?;
+    )
+    .await?;
     if !prep.ok {
         return Ok(prep);
     }
 
-    let uploaded = ssh::scp_to_remote(
+    let uploaded = scp_to_remote_blocking(
         server,
-        &binary_path,
-        &format!("{REMOTE_TMP_DIR}/mihomo"),
+        binary_path.clone(),
+        format!("{REMOTE_TMP_DIR}/mihomo"),
         Duration::from_secs(90),
-    )?;
+    )
+    .await?;
     if !uploaded.ok {
         return Ok(uploaded);
     }
@@ -161,7 +178,7 @@ printf 'mihomo %s installed from %s\n' "$(/usr/local/bin/mihomo -v | head -n 1)"
         asset_name = asset.name
     );
 
-    let mut result = ssh::run_ssh_script(server, &script, Duration::from_secs(90))?;
+    let mut result = run_ssh_script_blocking(server, script, Duration::from_secs(90)).await?;
     if result.ok && should_update_subscription {
         let update = update_subscription(
             server,
@@ -172,7 +189,11 @@ printf 'mihomo %s installed from %s\n' "$(/usr/local/bin/mihomo -v | head -n 1)"
         .await?;
         result.ok = update.ok;
         result.code = update.code;
-        result.stdout = format!("{}\n{}", result.stdout.trim_end(), update.stdout.trim_start());
+        result.stdout = format!(
+            "{}\n{}",
+            result.stdout.trim_end(),
+            update.stdout.trim_start()
+        );
         result.stderr = update.stderr;
     }
     Ok(result)
@@ -188,7 +209,7 @@ pub async fn update_subscription(
                 "set -euo pipefail\ninstall -d -m 0755 /etc/mihomo\ncat > /etc/mihomo/subscription.url <<'SUBEOF'\n{}\nSUBEOF\nchmod 600 /etc/mihomo/subscription.url\n",
                 shell_safe_multiline(url)
             );
-            let written = ssh::run_ssh_script(server, &script, Duration::from_secs(15))?;
+            let written = run_ssh_script_blocking(server, script, Duration::from_secs(15)).await?;
             if !written.ok {
                 return Ok(written);
             }
@@ -201,6 +222,14 @@ set -euo pipefail
 test -f /etc/mihomo/subscription.url
 install -d -m 0700 {REMOTE_TMP_DIR}
 sub="$(sed -n '1p' /etc/mihomo/subscription.url)"
+case "$sub" in
+  http://*|https://*) ;;
+  *) echo "subscription URL must start with http:// or https://" >&2; exit 2 ;;
+esac
+if printf '%s' "$sub" | grep -q '[[:space:][:cntrl:]]'; then
+  echo "subscription URL cannot contain spaces or control characters" >&2
+  exit 2
+fi
 curl -fsSL --connect-timeout 20 --max-time 90 --retry 2 \
   -A 'clash-verge' \
   --proxy http://127.0.0.1:7890 \
@@ -209,7 +238,8 @@ curl -fsSL --connect-timeout 20 --max-time 90 --retry 2 \
 test -s {REMOTE_TMP_DIR}/config.yaml
 "#
     );
-    let downloaded = ssh::run_ssh_script(server, &download_script, Duration::from_secs(120))?;
+    let downloaded =
+        run_ssh_script_blocking(server, download_script, Duration::from_secs(120)).await?;
     if !downloaded.ok {
         return Ok(downloaded);
     }
@@ -217,23 +247,25 @@ test -s {REMOTE_TMP_DIR}/config.yaml
     let dir = tempdir().map_err(|err| err.to_string())?;
     let local_config = dir.path().join("config.yaml");
     let patched_config = dir.path().join("config.patched.yaml");
-    let pulled = ssh::scp_from_remote(
+    let pulled = scp_from_remote_blocking(
         server,
-        &format!("{REMOTE_TMP_DIR}/config.yaml"),
-        &local_config,
+        format!("{REMOTE_TMP_DIR}/config.yaml"),
+        local_config.clone(),
         Duration::from_secs(40),
-    )?;
+    )
+    .await?;
     if !pulled.ok {
         return Ok(pulled);
     }
 
-    patch_config_file(&local_config, &patched_config)?;
-    let pushed = ssh::scp_to_remote(
+    patch_config_file_blocking(local_config, patched_config.clone()).await?;
+    let pushed = scp_to_remote_blocking(
         server,
-        &patched_config,
-        &format!("{REMOTE_TMP_DIR}/config.patched.yaml"),
+        patched_config.clone(),
+        format!("{REMOTE_TMP_DIR}/config.patched.yaml"),
         Duration::from_secs(40),
-    )?;
+    )
+    .await?;
     if !pushed.ok {
         return Ok(pushed);
     }
@@ -254,7 +286,7 @@ printf 'subscription updated at %s\n' "{updated_at}"
         updated_at = Utc::now().to_rfc3339()
     );
 
-    ssh::run_ssh_script(server, &install_script, Duration::from_secs(90))
+    run_ssh_script_blocking(server, install_script, Duration::from_secs(90)).await
 }
 
 pub fn set_service(server: &Server, state: &str) -> Result<ServiceCommandResult, String> {
@@ -341,7 +373,7 @@ fn patch_config_file(input: &Path, output: &Path) -> Result<(), String> {
 }
 
 pub fn patch_config_yaml(content: &str) -> Result<String, String> {
-    let mut value: Value = serde_yaml::from_str(content).map_err(|err| err.to_string())?;
+    let mut value: Value = yaml_serde::from_str(content).map_err(|err| err.to_string())?;
     let map = value
         .as_mapping_mut()
         .ok_or_else(|| "subscription config must be a YAML mapping".to_string())?;
@@ -353,7 +385,7 @@ pub fn patch_config_yaml(content: &str) -> Result<String, String> {
         put_bool(map, "allow-lan", false);
     }
 
-    serde_yaml::to_string(&value).map_err(|err| err.to_string())
+    yaml_serde::to_string(&value).map_err(|err| err.to_string())
 }
 
 fn put_number(map: &mut Mapping, key: &str, number: i64) {
@@ -383,10 +415,14 @@ struct GitHubRelease {
 struct GitHubAsset {
     name: String,
     browser_download_url: String,
+    digest: Option<String>,
 }
 
-async fn latest_asset_for_arch(arch: &str) -> Result<GitHubAsset, String> {
-    let release: GitHubRelease = reqwest::Client::new()
+async fn latest_asset_for_arch(
+    client: &reqwest::Client,
+    arch: &str,
+) -> Result<GitHubAsset, String> {
+    let release: GitHubRelease = client
         .get(MIHOMO_RELEASE_API)
         .header("User-Agent", "mihomo-server-manager")
         .send()
@@ -414,28 +450,108 @@ async fn latest_asset_for_arch(arch: &str) -> Result<GitHubAsset, String> {
         .ok_or_else(|| format!("no mihomo release asset matched {needle}"))
 }
 
-async fn download_asset(url: &str, path: &Path) -> Result<(), String> {
-    let bytes = reqwest::Client::new()
-        .get(url)
+async fn download_asset(
+    client: &reqwest::Client,
+    asset: &GitHubAsset,
+    path: &Path,
+) -> Result<(), String> {
+    let response = client
+        .get(&asset.browser_download_url)
         .header("User-Agent", "mihomo-server-manager")
         .send()
         .await
         .map_err(|err| err.to_string())?
         .error_for_status()
-        .map_err(|err| err.to_string())?
-        .bytes()
-        .await
         .map_err(|err| err.to_string())?;
+    if let Some(length) = response.content_length() {
+        if length > MAX_MIHOMO_ARCHIVE_BYTES {
+            return Err(format!("mihomo archive is too large: {length} bytes"));
+        }
+    }
 
-    std::fs::write(path, bytes).map_err(|err| err.to_string())
+    let bytes = response.bytes().await.map_err(|err| err.to_string())?;
+    if bytes.len() as u64 > MAX_MIHOMO_ARCHIVE_BYTES {
+        return Err(format!(
+            "mihomo archive is too large: {} bytes",
+            bytes.len()
+        ));
+    }
+    verify_asset_digest(asset.digest.as_deref(), &bytes)?;
+
+    let path = path.to_path_buf();
+    blocking(move || std::fs::write(path, bytes).map_err(|err| err.to_string())).await
+}
+
+fn verify_asset_digest(expected: Option<&str>, bytes: &[u8]) -> Result<(), String> {
+    let expected = expected.ok_or_else(|| "release asset is missing SHA256 digest".to_string())?;
+    let Some(expected) = expected.strip_prefix("sha256:") else {
+        return Err("release asset digest must use sha256".to_string());
+    };
+    if expected.len() != 64 || !expected.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Err("release asset SHA256 digest is invalid".to_string());
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let actual = format!("{:x}", hasher.finalize());
+    if actual.eq_ignore_ascii_case(expected) {
+        Ok(())
+    } else {
+        Err("mihomo archive SHA256 digest mismatch".to_string())
+    }
+}
+
+async fn run_ssh_script_blocking(
+    server: &Server,
+    script: String,
+    timeout: Duration,
+) -> Result<CommandResult, String> {
+    let server = server.clone();
+    blocking(move || ssh::run_ssh_script(&server, &script, timeout)).await
+}
+
+async fn scp_to_remote_blocking(
+    server: &Server,
+    local_path: PathBuf,
+    remote_path: String,
+    timeout: Duration,
+) -> Result<CommandResult, String> {
+    let server = server.clone();
+    blocking(move || ssh::scp_to_remote(&server, &local_path, &remote_path, timeout)).await
+}
+
+async fn scp_from_remote_blocking(
+    server: &Server,
+    remote_path: String,
+    local_path: PathBuf,
+    timeout: Duration,
+) -> Result<CommandResult, String> {
+    let server = server.clone();
+    blocking(move || ssh::scp_from_remote(&server, &remote_path, &local_path, timeout)).await
+}
+
+async fn decompress_gzip_blocking(input: PathBuf, output: PathBuf) -> Result<(), String> {
+    blocking(move || decompress_gzip(&input, &output)).await
+}
+
+async fn patch_config_file_blocking(input: PathBuf, output: PathBuf) -> Result<(), String> {
+    blocking(move || patch_config_file(&input, &output)).await
+}
+
+async fn blocking<T, F>(operation: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+{
+    tokio::task::spawn_blocking(operation)
+        .await
+        .map_err(|err| format!("blocking task failed: {err}"))?
 }
 
 fn decompress_gzip(input: &Path, output: &Path) -> Result<(), String> {
     let mut decoder = GzDecoder::new(File::open(input).map_err(|err| err.to_string())?);
     let mut out = File::create(output).map_err(|err| err.to_string())?;
-    let mut buffer = Vec::new();
-    decoder.read_to_end(&mut buffer).map_err(|err| err.to_string())?;
-    out.write_all(&buffer).map_err(|err| err.to_string())?;
+    io::copy(&mut decoder, &mut out).map_err(|err| err.to_string())?;
     Ok(())
 }
 
@@ -445,7 +561,7 @@ fn shell_safe_multiline(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::patch_config_yaml;
+    use super::{patch_config_yaml, verify_asset_digest};
 
     #[test]
     fn patches_required_keys_and_preserves_allow_lan() {
@@ -468,5 +584,14 @@ proxies: []
     fn defaults_allow_lan_to_false_when_missing() {
         let patched = patch_config_yaml("proxies: []").unwrap();
         assert!(patched.contains("allow-lan: false"));
+    }
+
+    #[test]
+    fn verifies_release_asset_sha256_digest() {
+        let empty_sha256 = "sha256:e3b0c44298fc1c149afbf4c8996fb924\
+                            27ae41e4649b934ca495991b7852b855";
+        assert!(verify_asset_digest(Some(empty_sha256), b"").is_ok());
+        assert!(verify_asset_digest(Some(empty_sha256), b"changed").is_err());
+        assert!(verify_asset_digest(None, b"").is_err());
     }
 }

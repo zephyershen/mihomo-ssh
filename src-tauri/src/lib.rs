@@ -1,8 +1,8 @@
 mod controller;
 mod mihomo;
 mod models;
-mod remote_proxy;
 mod redaction;
+mod remote_proxy;
 mod ssh;
 mod storage;
 
@@ -43,77 +43,84 @@ fn import_ssh_hosts(state: State<'_, AppState>) -> Result<Vec<Server>, String> {
 }
 
 #[tauri::command]
-fn get_managed_ssh_key(state: State<'_, AppState>) -> Result<ManagedSshKeyInfo, String> {
-    ssh::ensure_managed_key(&state.app_dir)
+async fn get_managed_ssh_key(state: State<'_, AppState>) -> Result<ManagedSshKeyInfo, String> {
+    let app_dir = state.app_dir.clone();
+    run_blocking(move || ssh::ensure_managed_key(&app_dir)).await
 }
 
 #[tauri::command]
-fn add_manual_server(
+async fn add_manual_server(
     state: State<'_, AppState>,
     input: ManualServerInput,
 ) -> Result<Vec<Server>, String> {
-    let input = normalize_manual_server_input(input)?;
-    let key = ssh::ensure_managed_key(&state.app_dir)?;
-    let private_key = ssh::managed_private_key_path(&state.app_dir);
-    let servers =
-        state
-            .storage
-            .upsert_manual_server(&input, &private_key, &key.private_key_hint)?;
-    state.storage.add_log(
-        None,
-        "add_manual_server",
-        "ok",
-        &format!(
-            "added {}@{}:{}",
-            input.user,
-            input.host_name,
-            input.port.unwrap_or(22)
-        ),
-    )?;
-    Ok(servers)
+    let storage = state.storage.clone();
+    let app_dir = state.app_dir.clone();
+    run_blocking(move || {
+        let input = normalize_manual_server_input(input)?;
+        let key = ssh::ensure_managed_key(&app_dir)?;
+        let private_key = ssh::managed_private_key_path(&app_dir);
+        let servers = storage.upsert_manual_server(&input, &private_key, &key.private_key_hint)?;
+        storage.add_log(
+            None,
+            "add_manual_server",
+            "ok",
+            &format!(
+                "added {}@{}:{}",
+                input.user,
+                input.host_name,
+                input.port.unwrap_or(22)
+            ),
+        )?;
+        Ok(servers)
+    })
+    .await
 }
 
 #[tauri::command]
-fn bootstrap_server_with_password(
+async fn bootstrap_server_with_password(
     state: State<'_, AppState>,
     input: ServerBootstrapInput,
 ) -> Result<Vec<Server>, String> {
-    let input = normalize_bootstrap_input(input)?;
-    let key = ssh::ensure_managed_key(&state.app_dir)?;
-    let result = ssh::bootstrap_authorized_key(&input, &key.public_key, Duration::from_secs(25))?;
-    if !result.ok {
-        state.storage.add_log(
+    let storage = state.storage.clone();
+    let app_dir = state.app_dir.clone();
+    run_blocking(move || {
+        let input = normalize_bootstrap_input(input)?;
+        let key = ssh::ensure_managed_key(&app_dir)?;
+        let result =
+            ssh::bootstrap_authorized_key(&input, &key.public_key, Duration::from_secs(25))?;
+        if !result.ok {
+            storage.add_log(
+                None,
+                "bootstrap_server_with_password",
+                "error",
+                command_summary(&result).as_str(),
+            )?;
+            return Err(command_summary(&result));
+        }
+
+        let manual_input = ManualServerInput {
+            display_name: input.display_name,
+            host_name: input.host_name,
+            user: input.user,
+            port: input.port,
+        };
+        let private_key = ssh::managed_private_key_path(&app_dir);
+        let servers =
+            storage.upsert_manual_server(&manual_input, &private_key, &key.private_key_hint)?;
+        storage.add_log(
             None,
             "bootstrap_server_with_password",
-            "error",
-            command_summary(&result).as_str(),
+            "ok",
+            &format!(
+                "installed managed key on {}@{}:{}",
+                manual_input.user,
+                manual_input.host_name,
+                manual_input.port.unwrap_or(22)
+            ),
         )?;
-        return Err(command_summary(&result));
-    }
-
-    let manual_input = ManualServerInput {
-        display_name: input.display_name,
-        host_name: input.host_name,
-        user: input.user,
-        port: input.port,
-    };
-    let private_key = ssh::managed_private_key_path(&state.app_dir);
-    let servers =
-        state
-            .storage
-            .upsert_manual_server(&manual_input, &private_key, &key.private_key_hint)?;
-    state.storage.add_log(
-        None,
-        "bootstrap_server_with_password",
-        "ok",
-        &format!(
-            "installed managed key on {}@{}:{}",
-            manual_input.user,
-            manual_input.host_name,
-            manual_input.port.unwrap_or(22)
-        ),
-    )?;
-    Ok(servers)
+        Ok(servers)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -185,30 +192,39 @@ fn mark_subscription_used(
 }
 
 #[tauri::command]
-fn test_connection(state: State<'_, AppState>, server_id: i64) -> Result<CommandResult, String> {
-    let server = state.storage.get_server(server_id)?;
-    let result = ssh::run_ssh_script(&server, "true", Duration::from_secs(12))?;
-    let status = if result.ok { "online" } else { "offline" };
-    state.storage.update_status(server_id, status)?;
-    state.storage.add_log(
-        Some(server_id),
-        "test_connection",
-        status,
-        command_summary(&result).as_str(),
-    )?;
-    Ok(result)
+async fn test_connection(
+    state: State<'_, AppState>,
+    server_id: i64,
+) -> Result<CommandResult, String> {
+    let storage = state.storage.clone();
+    run_blocking(move || {
+        let server = storage.get_server(server_id)?;
+        let result = ssh::run_ssh_script(&server, "true", Duration::from_secs(12))?;
+        let status = if result.ok { "online" } else { "offline" };
+        storage.update_status(server_id, status)?;
+        storage.add_log(
+            Some(server_id),
+            "test_connection",
+            status,
+            command_summary(&result).as_str(),
+        )?;
+        Ok(result)
+    })
+    .await
 }
 
 #[tauri::command]
-fn test_server_egress(
+async fn test_server_egress(
     state: State<'_, AppState>,
     server_id: i64,
     url: String,
 ) -> Result<EgressTestResult, String> {
-    let server = state.storage.get_server(server_id)?;
-    let url = normalize_test_url(&url)?;
-    let script = format!(
-        r#"
+    let storage = state.storage.clone();
+    run_blocking(move || {
+        let server = storage.get_server(server_id)?;
+        let url = normalize_test_url(&url)?;
+        let script = format!(
+            r#"
 set -e
 url={url}
 if command -v curl >/dev/null 2>&1; then
@@ -227,18 +243,28 @@ else
   exit 127
 fi
 "#,
-        url = shell_quote(&url)
-    );
-    let result = ssh::run_ssh_script(&server, &script, Duration::from_secs(18))?;
-    let parsed = parse_egress_output(&url, result);
-    let status = if parsed.ok { "ok" } else { "error" };
-    state.storage.add_log(
-        Some(server_id),
-        "test_server_egress",
-        status,
-        &format!("url={}", parsed.url),
-    )?;
-    Ok(parsed)
+            url = shell_quote(&url)
+        );
+        let result = ssh::run_ssh_script(&server, &script, Duration::from_secs(18))?;
+        let parsed = parse_egress_output(&url, result);
+        let status = if parsed.ok { "ok" } else { "error" };
+        storage.add_log(
+            Some(server_id),
+            "test_server_egress",
+            status,
+            &format!(
+                "status={} elapsed={} url={}",
+                parsed.status.as_deref().unwrap_or("-"),
+                parsed
+                    .elapsed_ms
+                    .map(|value| format!("{value}ms"))
+                    .unwrap_or_else(|| "-".to_string()),
+                redaction::redact(&parsed.url)
+            ),
+        )?;
+        Ok(parsed)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -273,13 +299,10 @@ async fn install_or_repair_mihomo(
     options: Option<InstallOptions>,
 ) -> Result<CommandResult, String> {
     let server = state.storage.get_server(server_id)?;
-    let result = mihomo::install_or_repair(
-        &server,
-        options.unwrap_or(InstallOptions {
-            subscription_url: None,
-        }),
-    )
-    .await?;
+    let options = normalize_install_options(options.unwrap_or(InstallOptions {
+        subscription_url: None,
+    }))?;
+    let result = mihomo::install_or_repair(&server, options).await?;
     log_command(
         &state.storage,
         server_id,
@@ -296,78 +319,90 @@ async fn update_subscription(
     options: Option<SubscriptionUpdateOptions>,
 ) -> Result<CommandResult, String> {
     let server = state.storage.get_server(server_id)?;
-    let result = mihomo::update_subscription(
-        &server,
-        options.unwrap_or(SubscriptionUpdateOptions {
+    let options =
+        normalize_subscription_update_options(options.unwrap_or(SubscriptionUpdateOptions {
             subscription_url: None,
-        }),
-    )
-    .await?;
+        }))?;
+    let result = mihomo::update_subscription(&server, options).await?;
     log_command(&state.storage, server_id, "update_subscription", &result)?;
     Ok(result)
 }
 
 #[tauri::command]
-fn set_mihomo_service(
+async fn set_mihomo_service(
     state: State<'_, AppState>,
     server_id: i64,
     service_state: String,
 ) -> Result<ServiceCommandResult, String> {
-    let server = state.storage.get_server(server_id)?;
-    let result = mihomo::set_service(&server, &service_state)?;
-    log_command(
-        &state.storage,
-        server_id,
-        &format!("service:{service_state}"),
-        &result.output,
-    )?;
-    Ok(result)
+    let storage = state.storage.clone();
+    run_blocking(move || {
+        let server = storage.get_server(server_id)?;
+        let result = mihomo::set_service(&server, &service_state)?;
+        log_command(
+            &storage,
+            server_id,
+            &format!("service:{service_state}"),
+            &result.output,
+        )?;
+        Ok(result)
+    })
+    .await
 }
 
 #[tauri::command]
-fn inspect_remote_proxy(
+async fn inspect_remote_proxy(
     state: State<'_, AppState>,
     server_id: i64,
 ) -> Result<RemoteProxyConfig, String> {
-    let server = state.storage.get_server(server_id)?;
-    let result = remote_proxy::inspect(&server)?;
-    state
-        .storage
-        .add_log(Some(server_id), "inspect_remote_proxy", "ok", "loaded")?;
-    Ok(result)
+    let storage = state.storage.clone();
+    run_blocking(move || {
+        let server = storage.get_server(server_id)?;
+        let result = remote_proxy::inspect(&server)?;
+        storage.add_log(Some(server_id), "inspect_remote_proxy", "ok", "loaded")?;
+        Ok(result)
+    })
+    .await
 }
 
 #[tauri::command]
-fn save_remote_proxy(
+async fn save_remote_proxy(
     state: State<'_, AppState>,
     server_id: i64,
     input: RemoteProxyInput,
 ) -> Result<CommandResult, String> {
-    let server = state.storage.get_server(server_id)?;
-    let result = remote_proxy::save(&server, input)?;
-    log_command(&state.storage, server_id, "save_remote_proxy", &result)?;
-    Ok(result)
+    let storage = state.storage.clone();
+    run_blocking(move || {
+        let server = storage.get_server(server_id)?;
+        let result = remote_proxy::save(&server, input)?;
+        log_command(&storage, server_id, "save_remote_proxy", &result)?;
+        Ok(result)
+    })
+    .await
 }
 
 #[tauri::command]
-fn set_remote_proxy_enabled(
+async fn set_remote_proxy_enabled(
     state: State<'_, AppState>,
     server_id: i64,
     enabled: bool,
 ) -> Result<CommandResult, String> {
-    let server = state.storage.get_server(server_id)?;
-    let result = remote_proxy::set_enabled(&server, enabled)?;
-    log_command(
-        &state.storage,
-        server_id,
-        if enabled {
-            "enable_remote_proxy"
-        } else {
-            "disable_remote_proxy"
-        },
-        &result,
-    )?;
-    Ok(result)
+    let storage = state.storage.clone();
+    run_blocking(move || {
+        let server = storage.get_server(server_id)?;
+        let result = remote_proxy::set_enabled(&server, enabled)?;
+        log_command(
+            &storage,
+            server_id,
+            if enabled {
+                "enable_remote_proxy"
+            } else {
+                "disable_remote_proxy"
+            },
+            &result,
+        )?;
+        Ok(result)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -404,7 +439,14 @@ async fn list_proxy_groups(
     server_id: i64,
 ) -> Result<Vec<ProxyGroup>, String> {
     let port = ensure_tunnel(&state, server_id)?;
-    controller::list_proxy_groups(port).await
+    let groups = controller::list_proxy_groups(port).await?;
+    state.storage.add_log(
+        Some(server_id),
+        "list_proxy_groups",
+        "ok",
+        &format!("loaded {} groups", groups.len()),
+    )?;
+    Ok(groups)
 }
 
 #[tauri::command]
@@ -432,7 +474,18 @@ async fn measure_proxy_delay(
     group: String,
 ) -> Result<Vec<ProxyNode>, String> {
     let port = ensure_tunnel(&state, server_id)?;
-    controller::measure_proxy_delay(port, &group).await
+    let nodes = controller::measure_proxy_delay(port, &group).await?;
+    let alive = nodes
+        .iter()
+        .filter(|node| node.alive != Some(false))
+        .count();
+    state.storage.add_log(
+        Some(server_id),
+        "measure_proxy_delay",
+        "ok",
+        &format!("group={group} nodes={} alive={alive}", nodes.len()),
+    )?;
+    Ok(nodes)
 }
 
 #[tauri::command]
@@ -442,17 +495,45 @@ async fn measure_proxy_node_delay(
     node: String,
 ) -> Result<ProxyNode, String> {
     let port = ensure_tunnel(&state, server_id)?;
-    controller::measure_proxy_node_delay(port, &node).await
+    let result = controller::measure_proxy_node_delay(port, &node).await?;
+    let status = if result.alive == Some(false) {
+        "error"
+    } else {
+        "ok"
+    };
+    let delay = result
+        .delay_ms
+        .map(|value| format!("{value}ms"))
+        .unwrap_or_else(|| "-".to_string());
+    state.storage.add_log(
+        Some(server_id),
+        "measure_proxy_node_delay",
+        status,
+        &format!("node={} delay={delay}", result.name),
+    )?;
+    Ok(result)
 }
 
 #[tauri::command]
-fn read_mihomo_logs(
+async fn read_mihomo_logs(
     state: State<'_, AppState>,
     server_id: i64,
     lines: Option<u32>,
 ) -> Result<String, String> {
-    let server = state.storage.get_server(server_id)?;
-    mihomo::read_logs(&server, lines.unwrap_or(200))
+    let storage = state.storage.clone();
+    run_blocking(move || {
+        let server = storage.get_server(server_id)?;
+        let lines = lines.unwrap_or(200);
+        let logs = mihomo::read_logs(&server, lines)?;
+        storage.add_log(
+            Some(server_id),
+            "read_mihomo_logs",
+            "ok",
+            &format!("read {} lines", logs.lines().count().min(lines as usize)),
+        )?;
+        Ok(logs)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -480,6 +561,16 @@ fn log_command(
     storage.add_log(Some(server_id), action, status, &command_summary(result))
 }
 
+async fn run_blocking<T, F>(operation: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+{
+    tokio::task::spawn_blocking(operation)
+        .await
+        .map_err(|err| format!("blocking task failed: {err}"))?
+}
+
 fn command_summary(result: &CommandResult) -> String {
     let body = if result.ok {
         result.stdout.trim()
@@ -502,7 +593,7 @@ fn normalize_test_url(input: &str) -> Result<String, String> {
         return Err("URL cannot contain spaces or control characters".to_string());
     }
 
-    let candidate = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+    let candidate = if trimmed.contains("://") {
         trimmed.to_string()
     } else {
         format!("https://{trimmed}")
@@ -522,6 +613,25 @@ fn normalize_subscription_input(mut input: SubscriptionInput) -> Result<Subscrip
         .filter(|value| !value.is_empty())
         .or_else(|| Some(subscription_name_from_url(&input.url)));
     Ok(input)
+}
+
+fn normalize_install_options(mut options: InstallOptions) -> Result<InstallOptions, String> {
+    options.subscription_url = normalize_optional_subscription_url(options.subscription_url)?;
+    Ok(options)
+}
+
+fn normalize_subscription_update_options(
+    mut options: SubscriptionUpdateOptions,
+) -> Result<SubscriptionUpdateOptions, String> {
+    options.subscription_url = normalize_optional_subscription_url(options.subscription_url)?;
+    Ok(options)
+}
+
+fn normalize_optional_subscription_url(value: Option<String>) -> Result<Option<String>, String> {
+    match value {
+        Some(url) if !url.trim().is_empty() => Ok(Some(normalize_subscription_url(&url)?)),
+        _ => Ok(None),
+    }
 }
 
 fn normalize_subscription_url(input: &str) -> Result<String, String> {
@@ -707,8 +817,11 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_test_url, parse_egress_output};
-    use crate::models::CommandResult;
+    use super::{
+        normalize_install_options, normalize_subscription_update_options, normalize_test_url,
+        parse_egress_output,
+    };
+    use crate::models::{CommandResult, InstallOptions, SubscriptionUpdateOptions};
 
     #[test]
     fn normalizes_external_test_urls() {
@@ -722,6 +835,29 @@ mod tests {
         );
         assert!(normalize_test_url("ftp://example.com").is_err());
         assert!(normalize_test_url("https://example.com/a b").is_err());
+    }
+
+    #[test]
+    fn validates_subscription_urls_for_remote_commands() {
+        let install = normalize_install_options(InstallOptions {
+            subscription_url: Some(" https://example.com/sub ".to_string()),
+        })
+        .unwrap();
+        assert_eq!(
+            install.subscription_url.as_deref(),
+            Some("https://example.com/sub")
+        );
+
+        assert!(
+            normalize_subscription_update_options(SubscriptionUpdateOptions {
+                subscription_url: Some("file:///tmp/config.yaml".to_string()),
+            })
+            .is_err()
+        );
+        assert!(normalize_install_options(InstallOptions {
+            subscription_url: Some("https://example.com/a b".to_string()),
+        })
+        .is_err());
     }
 
     #[test]

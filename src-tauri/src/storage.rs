@@ -25,8 +25,13 @@ impl Storage {
 
     fn connect(&self) -> Result<Connection, String> {
         let conn = Connection::open(&self.db_path).map_err(|err| err.to_string())?;
-        conn.execute_batch("PRAGMA foreign_keys = ON;")
-            .map_err(|err| err.to_string())?;
+        conn.execute_batch(
+            r#"
+            PRAGMA foreign_keys = ON;
+            PRAGMA busy_timeout = 5000;
+            "#,
+        )
+        .map_err(|err| err.to_string())?;
         Ok(conn)
     }
 
@@ -69,6 +74,9 @@ impl Storage {
               updated_at TEXT NOT NULL,
               last_used_at TEXT
             );
+
+            CREATE INDEX IF NOT EXISTS idx_operation_logs_server_id_id
+              ON operation_logs(server_id, id DESC);
             "#,
         )
         .map_err(|err| err.to_string())?;

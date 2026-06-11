@@ -5,8 +5,10 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc && vite build",
-    "check": "npm run build && npm test",
+    "build": "tsc && tsc --noEmit -p tsconfig.node.json && vite build",
+    "check": "npm run check:frontend && npm run check:rust",
+    "check:frontend": "npm run build && npm test",
+    "check:rust": "cargo fmt --manifest-path src-tauri/Cargo.toml --check && cargo check --manifest-path src-tauri/Cargo.toml --locked && cargo test --manifest-path src-tauri/Cargo.toml --locked",
     "preview": "vite preview",
     "tauri": "tauri",
     "desktop:dev": "tauri dev",
@@ -24,11 +26,12 @@
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.5.0",
+    "@types/node": "^22.19.21",
     "@types/react": "^18.3.18",
     "@types/react-dom": "^18.3.5",
     "@vitejs/plugin-react": "^4.3.4",
     "typescript": "^5.7.3",
     "vite": "^6.0.7",
-    "vitest": "^2.1.8"
+    "vitest": "^4.1.8"
   }
 }

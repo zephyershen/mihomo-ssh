@@ -5,12 +5,10 @@ import {
   CircleDot,
   Clipboard,
   Download,
-  FileText,
   Gauge,
   Globe,
   GripVertical,
   KeyRound,
-  ListRestart,
   Loader2,
   Network,
   Plus,
@@ -28,7 +26,7 @@ import {
   Wifi,
   XCircle,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "./lib/api";
 import { redactForDisplay } from "./lib/redaction";
 import {
@@ -108,7 +106,6 @@ export function App() {
   const [activeTab, setActiveTab] = useState<Tab>("overview");
   const [busy, setBusy] = useState<string | null>(null);
   const [toast, setToast] = useState<string>("");
-  const [commandOutput, setCommandOutput] = useState<string>("");
   const [egressUrl, setEgressUrl] = useState("https://www.gstatic.com/generate_204");
   const [egressResult, setEgressResult] = useState<EgressTestResult | null>(null);
   const [subscriptions, setSubscriptions] = useState<SubscriptionProfile[]>([]);
@@ -121,13 +118,15 @@ export function App() {
   const [remoteProxy, setRemoteProxy] = useState<RemoteProxyConfig | null>(null);
   const [remoteProxyDraft, setRemoteProxyDraft] =
     useState<RemoteProxyInput>(defaultRemoteProxyInput);
-  const [logs, setLogs] = useState("");
   const [operationLogs, setOperationLogs] = useState<OperationLog[]>([]);
   const [updateStatus, setUpdateStatus] = useState<AppUpdateStatus | null>(null);
   const [updateProgress, setUpdateProgress] = useState<AppUpdateProgress>({
     phase: "idle",
     message: "",
   });
+  const selectedIdRef = useRef<number | null>(selectedId);
+  const selectedGroupRef = useRef(selectedGroup);
+  const busyRunRef = useRef(0);
 
   const selected = useMemo(
     () => servers.find((server) => server.id === selectedId) ?? null,
@@ -160,15 +159,32 @@ export function App() {
   }, [loadServers, loadSubscriptions]);
 
   useEffect(() => {
+    selectedIdRef.current = selectedId;
     if (!selectedId) {
+      setHealth(null);
+      setGroups([]);
+      setSelectedGroup("");
+      setMeasuredNodes([]);
+      setEgressResult(null);
+      setRemoteProxy(null);
+      setRemoteProxyDraft(defaultRemoteProxyInput);
       return;
     }
+    setHealth(null);
+    setGroups([]);
+    setSelectedGroup("");
+    setMeasuredNodes([]);
     setEgressResult(null);
     setRemoteProxy(null);
+    setRemoteProxyDraft(defaultRemoteProxyInput);
     void refreshHealth(selectedId);
-    void refreshOperationLogs(selectedId);
+    void refreshOperationLogs();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedId]);
+
+  useEffect(() => {
+    selectedGroupRef.current = selectedGroup;
+  }, [selectedGroup]);
 
   useEffect(() => {
     if (activeTab !== "config" || !selectedId) {
@@ -195,6 +211,8 @@ export function App() {
     work: () => Promise<T>,
     onSuccess?: (value: T) => void,
   ): Promise<T | undefined> {
+    const runId = busyRunRef.current + 1;
+    busyRunRef.current = runId;
     setBusy(label);
     setToast("");
     try {
@@ -206,36 +224,41 @@ export function App() {
       setToast(`${label} 失败：${String(error)}`);
       return undefined;
     } finally {
-      setBusy(null);
+      if (busyRunRef.current === runId) {
+        setBusy(null);
+      }
     }
   }
 
   async function refreshHealth(id = selectedId) {
     if (!id) return;
-    await run("刷新健康状态", () => api.inspectServer(id), setHealth);
+    const next = await run("刷新健康状态", () => api.inspectServer(id));
+    if (next && selectedIdRef.current === id) {
+      setHealth(next);
+    }
   }
 
-  async function refreshOperationLogs(id = selectedId) {
-    if (!id) return;
+  async function refreshOperationLogs() {
     try {
-      setOperationLogs(await api.listOperationLogs(id, 80));
-    } catch {
-      setOperationLogs([]);
+      setOperationLogs(await api.listOperationLogs(undefined, 120));
+    } catch (error) {
+      setToast(`读取操作记录失败：${String(error)}`);
     }
   }
 
   async function refreshRemoteProxy(id = selectedId) {
     if (!id) return;
-    await run("读取远端代理", () => api.inspectRemoteProxy(id), (next) => {
+    const next = await run("读取远端代理", () => api.inspectRemoteProxy(id));
+    if (next && selectedIdRef.current === id) {
       setRemoteProxy(next);
       setRemoteProxyDraft(remoteProxyInputFromConfig(next));
-    });
+    }
   }
 
   async function command(label: string, work: () => Promise<CommandResult>): Promise<CommandResult | undefined> {
     const result = await run(label, work);
     if (result) {
-      setCommandOutput(redactForDisplay(result.ok ? result.stdout || "ok" : result.stderr || "failed"));
+      setToast(`${label}${result.ok ? " 完成" : " 失败"}：${commandToastSummary(result)}`);
       void refreshHealth();
       void refreshOperationLogs();
     }
@@ -266,16 +289,15 @@ export function App() {
     }
   }
 
-  async function restartRemoteProxyService() {
-    if (!selected) return;
-    await command("重启远端代理服务", () => service(selected.id, "restart"));
-  }
-
   async function importHosts() {
     await run("导入 SSH 主机", api.importSshHosts, (next) => {
       setServers(next);
       setSelectedId(next[0]?.id ?? null);
     });
+  }
+
+  async function refreshServers() {
+    await run("刷新服务器列表", loadServers);
   }
 
   async function toggleAddServer() {
@@ -311,7 +333,6 @@ export function App() {
     setHealth(null);
     setGroups([]);
     setMeasuredNodes([]);
-    setCommandOutput("");
     setEgressResult(null);
   }
 
@@ -362,9 +383,7 @@ export function App() {
         setHealth(null);
         setGroups([]);
         setMeasuredNodes([]);
-        setLogs("");
         setOperationLogs([]);
-        setCommandOutput("");
         setEgressResult(null);
       }
     });
@@ -409,7 +428,9 @@ export function App() {
   async function markSubscriptionUsed(subscriptionId: number) {
     try {
       const profile = await api.markSubscriptionUsed(subscriptionId);
-      upsertSubscription(profile);
+      setSubscriptions((current) =>
+        sortSubscriptions([profile, ...current.filter((item) => item.id !== profile.id)]),
+      );
     } catch {
       // 最近使用时间只影响本地排序，失败不影响远端订阅更新结果。
     }
@@ -462,24 +483,35 @@ export function App() {
 
   async function testEgress() {
     if (!selected) return;
+    const serverId = selected.id;
     const result = await run(
       "测试外网访问",
-      () => api.testServerEgress(selected.id, egressUrl),
-      (value) => setEgressResult(value),
+      () => api.testServerEgress(serverId, egressUrl),
     );
+    if (!result || selectedIdRef.current !== serverId) {
+      return;
+    }
     if (result) {
-      setCommandOutput(redactForDisplay(result.output.ok ? result.output.stdout : result.output.stderr));
+      setEgressResult(result);
+      const detail = result.ok
+        ? `${result.status ?? "ok"}${result.elapsedMs ? ` · ${result.elapsedMs} ms` : ""}`
+        : commandToastSummary(result.output);
+      setToast(`测试外网访问${result.ok ? " 完成" : " 失败"}：${detail}`);
       void refreshOperationLogs();
     }
   }
 
   async function loadProxyGroups() {
     if (!selected) return;
-    await run("加载节点", () => api.listProxyGroups(selected.id), (next) => {
+    const serverId = selected.id;
+    const next = await run("加载节点", () => api.listProxyGroups(serverId));
+    if (next && selectedIdRef.current === serverId) {
       setGroups(next);
-      setSelectedGroup((current) => current || next[0]?.name || "");
+      setSelectedGroup((current) =>
+        next.some((group) => group.name === current) ? current : next[0]?.name || "",
+      );
       setMeasuredNodes([]);
-    });
+    }
   }
 
   function changeSelectedGroup(group: string) {
@@ -489,7 +521,12 @@ export function App() {
 
   async function measureDelay() {
     if (!selected || !selectedGroup) return;
-    await run("测速", () => api.measureProxyDelay(selected.id, selectedGroup), setMeasuredNodes);
+    const serverId = selected.id;
+    const groupName = selectedGroup;
+    const next = await run("测速", () => api.measureProxyDelay(serverId, groupName));
+    if (next && selectedIdRef.current === serverId && selectedGroupRef.current === groupName) {
+      setMeasuredNodes(next);
+    }
   }
 
   function mergeNodeResult(nodes: ProxyNode[], result: ProxyNode): ProxyNode[] {
@@ -509,30 +546,34 @@ export function App() {
 
   async function testSingleNode(node: string) {
     if (!selected) return;
-    await run("测试节点", () => api.measureProxyNodeDelay(selected.id, node), (result) => {
-      setGroups((current) =>
-        current.map((group) =>
-          group.name === selectedGroup ? { ...group, nodes: mergeNodeResult(group.nodes, result) } : group,
-        ),
-      );
-      setMeasuredNodes((current) =>
-        mergeNodeResult(current.length ? current : currentGroup?.nodes ?? [], result),
-      );
-    });
+    const serverId = selected.id;
+    const groupName = selectedGroup;
+    const baseNodes = currentGroup?.nodes ?? [];
+    const result = await run("测试节点", () => api.measureProxyNodeDelay(serverId, node));
+    if (!result || selectedIdRef.current !== serverId || selectedGroupRef.current !== groupName) {
+      return;
+    }
+    setGroups((current) =>
+      current.map((group) =>
+        group.name === groupName ? { ...group, nodes: mergeNodeResult(group.nodes, result) } : group,
+      ),
+    );
+    setMeasuredNodes((current) =>
+      mergeNodeResult(current.length ? current : baseNodes, result),
+    );
   }
 
   async function selectNode(group: string, node: string) {
     if (!selected) return;
-    await run("切换节点", () => api.selectProxyNode(selected.id, group, node), (next) => {
+    const serverId = selected.id;
+    const next = await run("切换节点", () => api.selectProxyNode(serverId, group, node));
+    if (next && selectedIdRef.current === serverId) {
       setGroups(next);
-    });
-  }
-
-  async function readLogs() {
-    if (!selected) return;
-    await run("读取日志", () => api.readMihomoLogs(selected.id, 240), (value) =>
-      setLogs(redactForDisplay(value)),
-    );
+      setMeasuredNodes([]);
+      setSelectedGroup((current) =>
+        next.some((item) => item.name === current) ? current : next[0]?.name || "",
+      );
+    }
   }
 
   async function checkUpdates() {
@@ -559,8 +600,14 @@ export function App() {
     }
   }
 
-  const currentGroup = groups.find((group) => group.name === selectedGroup);
-  const displayedNodes = measuredNodes.length ? measuredNodes : currentGroup?.nodes ?? [];
+  const currentGroup = useMemo(
+    () => groups.find((group) => group.name === selectedGroup),
+    [groups, selectedGroup],
+  );
+  const displayedNodes = useMemo(
+    () => (measuredNodes.length ? measuredNodes : currentGroup?.nodes ?? []),
+    [currentGroup, measuredNodes],
+  );
   const selectedNodeName = currentGroup?.now ?? null;
 
   return (
@@ -583,7 +630,7 @@ export function App() {
           <button className="icon-button" title="导入 SSH config" onClick={importHosts} disabled={!!busy}>
             <UploadCloud size={17} />
           </button>
-          <button className="icon-button" title="刷新服务器列表" onClick={loadServers} disabled={!!busy}>
+          <button className="icon-button" title="刷新服务器列表" onClick={refreshServers} disabled={!!busy}>
             <RefreshCcw size={17} />
           </button>
         </div>
@@ -702,7 +749,6 @@ export function App() {
               setSubscriptionUrl={(value) => updateSubscriptionDraft("url", value)}
               onInstall={installOrRepairSelected}
               onInspect={() => refreshHealth()}
-              output={commandOutput}
             />
           )}
 
@@ -720,10 +766,6 @@ export function App() {
               onSaveRefresh={saveAndRefreshSubscription}
               onRefreshProfile={refreshSubscriptionProfile}
               onDeleteProfile={deleteSubscriptionProfile}
-              onRefreshSaved={() =>
-                selected && command("刷新已保存订阅", () => api.updateSubscription(selected.id))
-              }
-              output={commandOutput}
             />
           )}
 
@@ -747,18 +789,15 @@ export function App() {
 
           {activeTab === "config" && (
             <ConfigPanel
-              health={health}
               selected={selected}
               busy={busy}
               remoteProxy={remoteProxy}
               remoteProxyDraft={remoteProxyDraft}
-              commandOutput={commandOutput}
               onProxyDraftChange={updateRemoteProxyDraft}
               onProxyRead={() => refreshRemoteProxy()}
               onProxySave={saveRemoteProxyDraft}
               onProxyEnable={() => setRemoteProxyState(true)}
               onProxyDisable={() => setRemoteProxyState(false)}
-              onProxyRestart={restartRemoteProxyService}
             />
           )}
 
@@ -766,9 +805,7 @@ export function App() {
             <LogsPanel
               selected={selected}
               busy={busy}
-              logs={logs}
               operationLogs={operationLogs}
-              onReadLogs={readLogs}
               onReadOps={() => refreshOperationLogs()}
             />
           )}
@@ -963,6 +1000,12 @@ async function service(serverId: number, serviceState: string): Promise<CommandR
   return response.output;
 }
 
+function commandToastSummary(result: CommandResult): string {
+  const body = result.ok ? result.stdout.trim() || "ok" : result.stderr.trim() || "failed";
+  const compact = redactForDisplay(body).replace(/\s+/g, " ").trim();
+  return compact.length > 180 ? `${compact.slice(0, 177)}...` : compact;
+}
+
 function OverviewPanel(props: {
   selected: Server | null;
   health: ServerHealth | null;
@@ -1028,7 +1071,10 @@ function OverviewPanel(props: {
           </button>
         </div>
         {props.egressResult && (
-          <div className={`egress-result ${props.egressResult.ok ? "ok" : "error"}`} title={props.egressResult.url}>
+          <div
+            className={`egress-result ${props.egressResult.ok ? "ok" : "error"}`}
+            title={redactForDisplay(props.egressResult.url)}
+          >
             <strong>{props.egressResult.ok ? "reachable" : "failed"}</strong>
             <span>
               {props.egressResult.status ?? "-"}
@@ -1050,10 +1096,9 @@ function InstallPanel(props: {
   setSubscriptionUrl: (value: string) => void;
   onInstall: () => void;
   onInspect: () => void;
-  output: string;
 }) {
   return (
-    <div className="split-layout">
+    <div className="single-layout">
       <div className="work-panel">
         <div className="panel-title">Install</div>
         {props.subscription && (
@@ -1076,7 +1121,6 @@ function InstallPanel(props: {
         </div>
         <HealthChecklist health={props.health} />
       </div>
-      <OutputPanel output={props.output} />
     </div>
   );
 }
@@ -1094,26 +1138,15 @@ function SubscriptionPanel(props: {
   onSaveRefresh: () => void;
   onRefreshProfile: (profile: SubscriptionProfile) => void;
   onDeleteProfile: (profile: SubscriptionProfile) => void;
-  onRefreshSaved: () => void;
-  output: string;
 }) {
   return (
-    <div className="split-layout">
+    <div className="single-layout">
       <div className="work-panel">
         <div className="panel-title">Subscription</div>
         <div className="subscription-toolbar">
           <button className="command-button" disabled={!!props.busy} onClick={props.onNew}>
             <Plus size={17} />
             新建
-          </button>
-          <button
-            className="command-button"
-            disabled={!props.selected || !!props.busy || !props.health?.hasSubscription}
-            title="使用服务器上已保存的订阅地址刷新"
-            onClick={props.onRefreshSaved}
-          >
-            <RefreshCcw size={17} />
-            刷新远端保存
           </button>
         </div>
 
@@ -1153,8 +1186,8 @@ function SubscriptionPanel(props: {
             disabled={!props.selected || !!props.busy || !props.draft.url.trim()}
             onClick={props.onSaveRefresh}
           >
-            <ListRestart size={17} />
-            保存并刷新
+            <Save size={17} />
+            保存
           </button>
         </div>
         <div className="kv-grid compact">
@@ -1170,7 +1203,6 @@ function SubscriptionPanel(props: {
           </div>
         )}
       </div>
-      <OutputPanel output={props.output} />
     </div>
   );
 }
@@ -1336,34 +1368,20 @@ function NodesPanel(props: {
 }
 
 function ConfigPanel(props: {
-  health: ServerHealth | null;
   selected: Server | null;
   busy: string | null;
   remoteProxy: RemoteProxyConfig | null;
   remoteProxyDraft: RemoteProxyInput;
-  commandOutput: string;
   onProxyDraftChange: (field: keyof RemoteProxyInput, value: string | boolean) => void;
   onProxyRead: () => void;
   onProxySave: () => void;
   onProxyEnable: () => void;
   onProxyDisable: () => void;
-  onProxyRestart: () => void;
 }) {
-  const { health, selected } = props;
+  const { selected } = props;
   return (
-    <div className="split-layout config-layout">
+    <div className="config-page">
       <div className="work-panel">
-        <div className="panel-title">Key Fields</div>
-        <div className="kv-grid">
-          <KeyValue label="Host" value={selected?.hostName} />
-          <KeyValue label="User" value={selected?.user} />
-          <KeyValue label="Port" value={selected?.port} />
-          <KeyValue label="Identity" value={selected?.identityFileHint || "ssh config/default key"} />
-          <KeyValue label="mixed-port" value={health?.mixedPort} />
-          <KeyValue label="controller" value={health?.controller} />
-          <KeyValue label="allow-lan" value={String(health?.allowLan ?? "unknown")} />
-          <KeyValue label="geo-auto-update" value={String(health?.geoAutoUpdate ?? "unknown")} />
-        </div>
         <RemoteProxyPanel
           selected={selected}
           busy={props.busy}
@@ -1374,14 +1392,7 @@ function ConfigPanel(props: {
           onSave={props.onProxySave}
           onEnable={props.onProxyEnable}
           onDisable={props.onProxyDisable}
-          onRestart={props.onProxyRestart}
         />
-      </div>
-      <div className="output-panel">
-        <div className="panel-title">YAML Preview</div>
-        <pre>{redactForDisplay(health?.configPreview ?? "")}</pre>
-        <div className="panel-title output-spacer">Command Output</div>
-        <pre className="compact-output">{props.commandOutput}</pre>
       </div>
     </div>
   );
@@ -1397,22 +1408,42 @@ function RemoteProxyPanel(props: {
   onSave: () => void;
   onEnable: () => void;
   onDisable: () => void;
-  onRestart: () => void;
 }) {
   const status = props.config?.enabled ? "已打开" : props.config ? "已关闭" : "未读取";
+  const serverLabel = props.selected
+    ? `${props.selected.user ?? "user"}@${props.selected.hostName}:${props.selected.port ?? 22}`
+    : "未选择服务器";
+
   return (
     <div className="remote-proxy-panel">
       <div className="section-heading">
         <div>
-          <div className="panel-title">Remote Proxy</div>
-          <div className={`proxy-status ${props.config?.enabled ? "on" : "off"}`}>
+          <div className="panel-title">远端代理</div>
+          <div className={`proxy-status ${props.config ? (props.config.enabled ? "on" : "off") : ""}`}>
             {status}
-            {props.config?.managed ? " · app 管理" : " · 未接管"}
+            {props.config ? (props.config.managed ? " · app 管理" : " · 未接管") : ""}
           </div>
         </div>
         <button className="icon-button" title="读取远端代理" disabled={!props.selected || !!props.busy} onClick={props.onRead}>
           <RefreshCcw size={16} />
         </button>
+      </div>
+
+      <div className="proxy-summary">
+        <div className="proxy-summary-item">
+          <span>服务器</span>
+          <strong title={serverLabel}>{serverLabel}</strong>
+        </div>
+        <div className="proxy-summary-item">
+          <span>配置文件</span>
+          <strong title={props.config?.profilePath ?? "/etc/profile.d/mihomo-manager-proxy.sh"}>
+            {props.config?.profilePath ?? "/etc/profile.d/mihomo-manager-proxy.sh"}
+          </strong>
+        </div>
+        <div className="proxy-summary-item">
+          <span>检测到</span>
+          <strong>{props.config?.detectedEnv.length ?? 0} 个环境变量</strong>
+        </div>
       </div>
 
       <label className="toggle-line">
@@ -1462,37 +1493,29 @@ function RemoteProxyPanel(props: {
       <div className="button-row">
         <button className="command-button primary" disabled={!props.selected || !!props.busy} onClick={props.onSave}>
           <Save size={17} />
-          保存
+          保存配置
         </button>
         <button className="command-button" disabled={!props.selected || !!props.busy} onClick={props.onEnable}>
           <Power size={17} />
-          打开
+          启用
         </button>
         <button className="command-button danger" disabled={!props.selected || !!props.busy} onClick={props.onDisable}>
           <PowerOff size={17} />
-          关闭
+          停用
         </button>
-        <button className="command-button" disabled={!props.selected || !!props.busy} onClick={props.onRestart}>
-          <RotateCw size={17} />
-          重启 Mihomo
-        </button>
-      </div>
-
-      <div className="proxy-meta">
-        <KeyValue label="Profile" value={props.config?.profilePath ?? "/etc/profile.d/mihomo-manager-proxy.sh"} />
-        <KeyValue label="Detected" value={`${props.config?.detectedEnv.length ?? 0} vars`} />
       </div>
 
       {props.config?.detectedEnv.length ? (
         <div className="proxy-env-list">
-          {props.config.detectedEnv.map((item) => (
-            <div key={`${item.name}:${item.value}`} className="proxy-env-row">
+          {props.config.detectedEnv.map((item, index) => (
+            <div key={`${item.name}:${index}`} className="proxy-env-row">
               <span>{item.name}</span>
-              <strong>{item.value}</strong>
+              <strong title={redactForDisplay(item.value)}>{redactForDisplay(item.value)}</strong>
             </div>
           ))}
         </div>
       ) : null}
+
     </div>
   );
 }
@@ -1500,38 +1523,45 @@ function RemoteProxyPanel(props: {
 function LogsPanel(props: {
   selected: Server | null;
   busy: string | null;
-  logs: string;
   operationLogs: OperationLog[];
-  onReadLogs: () => void;
   onReadOps: () => void;
 }) {
+  const rows = useMemo(
+    () =>
+      props.operationLogs.map((log) => ({
+        ...log,
+        createdAtLabel: formatFullTime(log.createdAt),
+        messageLabel: redactForDisplay(log.message || "-"),
+      })),
+    [props.operationLogs],
+  );
+
   return (
-    <div className="split-layout">
+    <div className="logs-layout">
       <div className="work-panel">
-        <div className="panel-title">Operations</div>
-        <div className="button-row">
-          <button className="command-button" disabled={!props.selected || !!props.busy} onClick={props.onReadLogs}>
-            <FileText size={17} />
-            Journal
-          </button>
+        <div className="section-heading">
+          <div>
+            <div className="panel-title">操作记录</div>
+            <div className="proxy-status">每次操作和结果都会保留在这里，方便排查问题。</div>
+          </div>
           <button className="command-button" disabled={!props.selected || !!props.busy} onClick={props.onReadOps}>
             <RefreshCcw size={17} />
-            Local
+            刷新记录
           </button>
         </div>
         <div className="ops-list">
-          {props.operationLogs.map((log) => (
+          {rows.map((log) => (
             <div key={log.id} className="op-row">
               <span className={`op-status ${log.status}`}>{log.status}</span>
-              <span>{log.action}</span>
-              <time>{new Date(log.createdAt).toLocaleString()}</time>
+              <span className="op-action">{log.action}</span>
+              <span className="op-message" title={log.messageLabel}>{log.messageLabel}</span>
+              <time>{log.createdAtLabel}</time>
             </div>
           ))}
+          {!rows.length && (
+            <div className="empty-table">暂无操作记录</div>
+          )}
         </div>
-      </div>
-      <div className="output-panel">
-        <div className="panel-title">Journal</div>
-        <pre>{props.logs}</pre>
       </div>
     </div>
   );
@@ -1569,15 +1599,6 @@ function SecretInput({ value, onChange }: { value: string; onChange: (value: str
         onChange={(event) => onChange(event.target.value)}
       />
     </label>
-  );
-}
-
-function OutputPanel({ output }: { output: string }) {
-  return (
-    <div className="output-panel">
-      <div className="panel-title">Output</div>
-      <pre>{output}</pre>
-    </div>
   );
 }
 
@@ -1646,6 +1667,12 @@ function formatShortTime(value?: string | null): string {
     hour: "2-digit",
     minute: "2-digit",
   });
+}
+
+function formatFullTime(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "未知时间";
+  return date.toLocaleString();
 }
 
 function remoteProxyInputFromConfig(config: RemoteProxyConfig): RemoteProxyInput {

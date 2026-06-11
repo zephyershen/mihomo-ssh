@@ -74,7 +74,7 @@ printf 'new SSH login shells will use this configuration\n'
 }
 
 pub fn set_enabled(server: &Server, enabled: bool) -> Result<CommandResult, String> {
-    let current = inspect(server).unwrap_or_else(|_| default_config());
+    let current = inspect(server)?;
     let input = RemoteProxyInput {
         enabled,
         http_proxy: current
@@ -91,19 +91,6 @@ pub fn set_enabled(server: &Server, enabled: bool) -> Result<CommandResult, Stri
             .unwrap_or_else(|| DEFAULT_NO_PROXY.to_string()),
     };
     save(server, input)
-}
-
-fn default_config() -> RemoteProxyConfig {
-    RemoteProxyConfig {
-        enabled: false,
-        managed: false,
-        profile_path: PROFILE_PATH.to_string(),
-        http_proxy: Some(DEFAULT_HTTP_PROXY.to_string()),
-        https_proxy: Some(DEFAULT_HTTP_PROXY.to_string()),
-        all_proxy: Some(DEFAULT_ALL_PROXY.to_string()),
-        no_proxy: Some(DEFAULT_NO_PROXY.to_string()),
-        detected_env: Vec::new(),
-    }
 }
 
 fn empty_config() -> RemoteProxyConfig {

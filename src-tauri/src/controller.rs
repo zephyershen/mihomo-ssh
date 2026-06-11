@@ -1,5 +1,6 @@
 use std::{collections::HashMap, net::TcpListener, process::Child, sync::Mutex, time::Duration};
 
+use futures_util::{stream, StreamExt};
 use serde_json::{json, Value};
 use tokio::time::sleep;
 
@@ -7,6 +8,8 @@ use crate::{
     models::{ProxyGroup, ProxyNode, Server, TunnelInfo},
     ssh,
 };
+
+const MAX_CONCURRENT_NODE_DELAY_CHECKS: usize = 8;
 
 #[derive(Default)]
 pub struct TunnelRegistry {
@@ -108,11 +111,31 @@ impl TunnelRegistry {
     }
 }
 
+impl Drop for TunnelRegistry {
+    fn drop(&mut self) {
+        if let Ok(children) = self.children.get_mut() {
+            for process in children.values_mut() {
+                let _ = process.child.kill();
+                let _ = process.child.wait();
+            }
+            children.clear();
+        }
+    }
+}
+
 pub async fn list_proxy_groups(port: u16) -> Result<Vec<ProxyGroup>, String> {
-    wait_for_controller(port).await?;
+    let client = reqwest::Client::new();
+    list_proxy_groups_with_client(&client, port).await
+}
+
+async fn list_proxy_groups_with_client(
+    client: &reqwest::Client,
+    port: u16,
+) -> Result<Vec<ProxyGroup>, String> {
+    wait_for_controller(client, port).await?;
     let url = format!("http://127.0.0.1:{port}/proxies");
-    let data: Value = reqwest::Client::new()
-        .get(url)
+    let data: Value = client
+        .get(&url)
         .send()
         .await
         .map_err(|err| err.to_string())?
@@ -140,71 +163,71 @@ pub async fn select_proxy_node(port: u16, group: &str, node: &str) -> Result<(),
 }
 
 pub async fn measure_proxy_delay(port: u16, group: &str) -> Result<Vec<ProxyNode>, String> {
-    let groups = list_proxy_groups(port).await?;
+    let client = reqwest::Client::new();
+    let groups = list_proxy_groups_with_client(&client, port).await?;
     let Some(target) = groups.into_iter().find(|item| item.name == group) else {
         return Err(format!("proxy group not found: {group}"));
     };
 
-    let client = reqwest::Client::new();
-    let test_url = urlencoding::encode("https://www.gstatic.com/generate_204");
-    let mut measured = Vec::with_capacity(target.nodes.len());
-
-    for mut node in target.nodes {
-        let encoded = urlencoding::encode(&node.name);
-        let url =
-            format!("http://127.0.0.1:{port}/proxies/{encoded}/delay?timeout=5000&url={test_url}");
-        match client.get(url).send().await {
-            Ok(response) if response.status().is_success() => {
-                let value: Value = response.json().await.unwrap_or(Value::Null);
-                node.delay_ms = value.get("delay").and_then(Value::as_u64);
-                node.alive = Some(node.delay_ms.is_some());
+    let test_url = urlencoding::encode("https://www.gstatic.com/generate_204").into_owned();
+    let mut measured = stream::iter(target.nodes.into_iter().enumerate())
+        .map(|(index, node)| {
+            let client = client.clone();
+            let test_url = test_url.clone();
+            async move {
+                let node = measure_node_delay(&client, port, &test_url, node).await;
+                (index, node)
             }
-            _ => {
-                node.delay_ms = None;
-                node.alive = Some(false);
-            }
-        }
-        measured.push(node);
-    }
+        })
+        .buffer_unordered(MAX_CONCURRENT_NODE_DELAY_CHECKS)
+        .collect::<Vec<_>>()
+        .await;
 
-    Ok(measured)
+    measured.sort_by_key(|(index, _)| *index);
+    Ok(measured.into_iter().map(|(_, node)| node).collect())
 }
 
 pub async fn measure_proxy_node_delay(port: u16, node: &str) -> Result<ProxyNode, String> {
-    wait_for_controller(port).await?;
     let client = reqwest::Client::new();
-    let encoded = urlencoding::encode(node);
-    let test_url = urlencoding::encode("https://www.gstatic.com/generate_204");
+    wait_for_controller(&client, port).await?;
+    let test_url = urlencoding::encode("https://www.gstatic.com/generate_204").into_owned();
+    let node = ProxyNode {
+        name: node.to_string(),
+        node_type: None,
+        udp: None,
+        delay_ms: None,
+        alive: None,
+    };
+    Ok(measure_node_delay(&client, port, &test_url, node).await)
+}
+
+async fn measure_node_delay(
+    client: &reqwest::Client,
+    port: u16,
+    test_url: &str,
+    mut node: ProxyNode,
+) -> ProxyNode {
+    let encoded = urlencoding::encode(&node.name);
     let url =
         format!("http://127.0.0.1:{port}/proxies/{encoded}/delay?timeout=5000&url={test_url}");
 
     match client.get(url).send().await {
         Ok(response) if response.status().is_success() => {
             let value: Value = response.json().await.unwrap_or(Value::Null);
-            let delay_ms = value.get("delay").and_then(Value::as_u64);
-            Ok(ProxyNode {
-                name: node.to_string(),
-                node_type: None,
-                udp: None,
-                delay_ms,
-                alive: Some(delay_ms.is_some()),
-            })
+            node.delay_ms = value.get("delay").and_then(Value::as_u64);
+            node.alive = Some(node.delay_ms.is_some());
         }
-        Ok(response) => Ok(ProxyNode {
-            name: node.to_string(),
-            node_type: None,
-            udp: None,
-            delay_ms: None,
-            alive: Some(response.status().is_success()),
-        }),
-        Err(_) => Ok(ProxyNode {
-            name: node.to_string(),
-            node_type: None,
-            udp: None,
-            delay_ms: None,
-            alive: Some(false),
-        }),
+        Ok(response) => {
+            node.delay_ms = None;
+            node.alive = Some(response.status().is_success());
+        }
+        Err(_) => {
+            node.delay_ms = None;
+            node.alive = Some(false);
+        }
     }
+
+    node
 }
 
 pub fn parse_proxy_groups(data: &Value) -> Result<Vec<ProxyGroup>, String> {
@@ -253,20 +276,21 @@ pub fn parse_proxy_groups(data: &Value) -> Result<Vec<ProxyGroup>, String> {
         });
     }
 
-    groups.sort_by(|a, b| {
-        a.name
-            .to_ascii_lowercase()
-            .cmp(&b.name.to_ascii_lowercase())
-    });
+    groups.sort_by_cached_key(|group| group.name.to_ascii_lowercase());
     Ok(groups)
 }
 
-async fn wait_for_controller(port: u16) -> Result<(), String> {
-    let client = reqwest::Client::new();
+async fn wait_for_controller(client: &reqwest::Client, port: u16) -> Result<(), String> {
     let url = format!("http://127.0.0.1:{port}/version");
     for _ in 0..20 {
-        if client.get(&url).send().await.is_ok() {
-            return Ok(());
+        if let Ok(response) = client.get(&url).send().await {
+            if response.status().is_success() {
+                if let Ok(value) = response.json::<Value>().await {
+                    if value.get("version").and_then(Value::as_str).is_some() {
+                        return Ok(());
+                    }
+                }
+            }
         }
         sleep(Duration::from_millis(150)).await;
     }

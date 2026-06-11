@@ -10,4 +10,16 @@ describe("redactForDisplay", () => {
     expect(redacted).not.toContain("token=abc");
     expect(redacted).not.toContain("vmess://secret");
   });
+
+  it("redacts proxy credentials and ssh paths", () => {
+    const text =
+      "proxy=socks5h://user:pass@127.0.0.1:7890 key=/home/root/.ssh/id_ed25519 subscription=abc";
+    const redacted = redactForDisplay(text);
+
+    expect(redacted).toContain("[redacted-url]");
+    expect(redacted).toContain("[redacted-path]");
+    expect(redacted).toContain("subscription=[redacted]");
+    expect(redacted).not.toContain("user:pass");
+    expect(redacted).not.toContain("/.ssh/");
+  });
 });
