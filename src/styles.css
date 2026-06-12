@@ -562,9 +562,19 @@ pre {
   margin-bottom: 6px;
 }
 
+.tun-panel,
 .remote-proxy-panel {
   display: grid;
   gap: 16px;
+}
+
+.status-icon {
+  margin-top: 2px;
+  color: var(--muted);
+}
+
+.status-icon.on {
+  color: #15803d;
 }
 
 .proxy-status {
@@ -606,6 +616,33 @@ pre {
   overflow: hidden;
   color: var(--text);
   font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tun-summary {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.tun-protection {
+  display: flex;
+  min-height: 34px;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 7px;
+}
+
+.tun-protection span {
+  max-width: 100%;
+  overflow: hidden;
+  padding: 6px 9px;
+  border: 1px solid #bbf7d0;
+  border-radius: 8px;
+  color: #166534;
+  background: #f0fdf4;
+  font-family: "Cascadia Code", "Fira Code", Consolas, monospace;
+  font-size: 12px;
+  font-weight: 650;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -1281,6 +1318,12 @@ td:last-child {
   }
 
   .split-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .proxy-summary,
+  .tun-summary,
+  .proxy-field-grid {
     grid-template-columns: 1fr;
   }
 }

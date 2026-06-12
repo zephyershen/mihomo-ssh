@@ -352,6 +352,7 @@ async fn inspect_server(
     match mihomo::inspect_server(&server).await {
         Ok(mut health) => {
             health.config_preview = mihomo::read_remote_config(&server).await.ok();
+            health.tun = mihomo::inspect_tun_config(&server).await.ok().flatten();
             state.storage.update_status(server_id, "online")?;
             state
                 .storage
@@ -437,6 +438,43 @@ async fn set_mihomo_service(
         Ok(result)
     })
     .await
+}
+
+#[tauri::command]
+async fn set_mihomo_tun_enabled(
+    state: State<'_, AppState>,
+    server_id: i64,
+    enabled: bool,
+) -> Result<CommandResult, String> {
+    let storage = state.storage.clone();
+    let server = storage.get_server(server_id)?;
+    create_indexed_backup(
+        storage.clone(),
+        server.clone(),
+        if enabled {
+            "enable_tun".to_string()
+        } else {
+            "disable_tun".to_string()
+        },
+        Some(if enabled {
+            "打开 TUN 前".to_string()
+        } else {
+            "关闭 TUN 前".to_string()
+        }),
+    )
+    .await?;
+    let result = mihomo::set_tun_enabled(&server, enabled).await?;
+    log_command(
+        &storage,
+        server_id,
+        if enabled {
+            "enable_mihomo_tun"
+        } else {
+            "disable_mihomo_tun"
+        },
+        &result,
+    )?;
+    Ok(result)
 }
 
 #[tauri::command]
@@ -969,6 +1007,7 @@ pub fn run() {
             install_or_repair_mihomo,
             update_subscription,
             set_mihomo_service,
+            set_mihomo_tun_enabled,
             inspect_remote_proxy,
             save_remote_proxy,
             set_remote_proxy_enabled,

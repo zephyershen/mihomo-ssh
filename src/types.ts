@@ -43,8 +43,20 @@ export type ServerHealth = {
   controller?: string | null;
   allowLan?: boolean | null;
   geoAutoUpdate?: boolean | null;
+  tun?: TunConfig | null;
   configPreview?: string | null;
   checkedAt: string;
+};
+
+export type TunConfig = {
+  enabled: boolean;
+  stack?: string | null;
+  autoRoute?: boolean | null;
+  autoDetectInterface?: boolean | null;
+  autoRedirect?: boolean | null;
+  dnsHijack: string[];
+  routeExcludeAddress: string[];
+  sshProtection: string[];
 };
 
 export type CommandResult = {

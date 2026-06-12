@@ -15,7 +15,7 @@ use yaml_serde::{Mapping, Number, Value};
 use crate::{
     models::{
         CommandResult, InstallOptions, Server, ServerHealth, ServiceCommandResult,
-        SubscriptionUpdateOptions,
+        SubscriptionUpdateOptions, TunConfig,
     },
     ssh,
 };
@@ -23,6 +23,19 @@ use crate::{
 const MIHOMO_RELEASE_API: &str = "https://api.github.com/repos/MetaCubeX/mihomo/releases/latest";
 const REMOTE_TMP_DIR: &str = "/tmp/mihomo-manager";
 const MAX_MIHOMO_ARCHIVE_BYTES: u64 = 80 * 1024 * 1024;
+const BASE_TUN_EXCLUDES: &[&str] = &[
+    "10.0.0.0/8",
+    "100.64.0.0/10",
+    "127.0.0.0/8",
+    "169.254.0.0/16",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "224.0.0.0/4",
+    "::1/128",
+    "fc00::/7",
+    "fe80::/10",
+    "ff00::/8",
+];
 
 pub async fn inspect_server(server: &Server) -> Result<ServerHealth, String> {
     let script = r#"
@@ -73,6 +86,106 @@ pub async fn read_remote_config(server: &Server) -> Result<String, String> {
     } else {
         Err(output.stderr)
     }
+}
+
+pub async fn inspect_tun_config(server: &Server) -> Result<Option<TunConfig>, String> {
+    let output = run_ssh_script_blocking(
+        server,
+        r#"
+set +e
+test -f /etc/mihomo/config.yaml || exit 0
+awk '
+  /^tun:[[:space:]]*/ { in_tun=1; print; next }
+  in_tun && /^[^[:space:]]/ { exit }
+  in_tun { print }
+' /etc/mihomo/config.yaml
+"#
+        .to_string(),
+        Duration::from_secs(20),
+    )
+    .await?;
+    if output.ok {
+        parse_tun_config_yaml(&output.stdout)
+    } else {
+        Err(output.stderr)
+    }
+}
+
+pub async fn set_tun_enabled(server: &Server, enabled: bool) -> Result<CommandResult, String> {
+    let prep = run_ssh_script_blocking(
+        server,
+        format!("set -euo pipefail\ninstall -d -m 0700 {REMOTE_TMP_DIR}\ntest -f /etc/mihomo/config.yaml"),
+        Duration::from_secs(20),
+    )
+    .await?;
+    if !prep.ok {
+        return Ok(prep);
+    }
+
+    let ssh_excludes = if enabled {
+        collect_ssh_tun_excludes(server).await?
+    } else {
+        Vec::new()
+    };
+
+    let dir = tempdir().map_err(|err| err.to_string())?;
+    let local_config = dir.path().join("config.yaml");
+    let patched_config = dir.path().join("config.tun.yaml");
+    let pulled = scp_from_remote_blocking(
+        server,
+        "/etc/mihomo/config.yaml".to_string(),
+        local_config.clone(),
+        Duration::from_secs(40),
+    )
+    .await?;
+    if !pulled.ok {
+        return Ok(pulled);
+    }
+
+    patch_tun_config_file_blocking(local_config, patched_config.clone(), enabled, ssh_excludes)
+        .await?;
+    let pushed = scp_to_remote_blocking(
+        server,
+        patched_config,
+        format!("{REMOTE_TMP_DIR}/config.tun.yaml"),
+        Duration::from_secs(40),
+    )
+    .await?;
+    if !pushed.ok {
+        return Ok(pushed);
+    }
+
+    let state = if enabled { "enabled" } else { "disabled" };
+    let install_script = format!(
+        r#"
+set -euo pipefail
+ts="$(date +%Y%m%d%H%M%S)"
+rollback="/etc/mihomo/config.yaml.tun-rollback.${{ts}}"
+marker="/tmp/mihomo-manager-tun-ok.${{ts}}"
+cp -a /etc/mihomo/config.yaml "$rollback"
+/usr/local/bin/mihomo -t -d /etc/mihomo -f {REMOTE_TMP_DIR}/config.tun.yaml
+(
+  sleep 35
+  if [ ! -f "$marker" ]; then
+    cp -a "$rollback" /etc/mihomo/config.yaml
+    systemctl restart mihomo || true
+    logger -t mihomo-manager "TUN change rolled back because SSH confirmation marker was missing"
+  fi
+  rm -f "$marker" "$rollback"
+) >/dev/null 2>&1 &
+install -m 0644 {REMOTE_TMP_DIR}/config.tun.yaml /etc/mihomo/config.yaml
+systemctl restart mihomo
+sleep 3
+systemctl is-active mihomo
+touch "$marker"
+rm -rf {REMOTE_TMP_DIR}
+printf 'tun {state} at %s\n' "{updated_at}"
+"#,
+        state = state,
+        updated_at = Utc::now().to_rfc3339()
+    );
+
+    run_ssh_script_blocking(server, install_script, Duration::from_secs(90)).await
 }
 
 pub async fn install_or_repair(
@@ -246,7 +359,15 @@ test -s {REMOTE_TMP_DIR}/config.yaml
 
     let dir = tempdir().map_err(|err| err.to_string())?;
     let local_config = dir.path().join("config.yaml");
+    let current_config = dir.path().join("config.current.yaml");
     let patched_config = dir.path().join("config.patched.yaml");
+    let current_pulled = scp_from_remote_blocking(
+        server,
+        "/etc/mihomo/config.yaml".to_string(),
+        current_config.clone(),
+        Duration::from_secs(40),
+    )
+    .await?;
     let pulled = scp_from_remote_blocking(
         server,
         format!("{REMOTE_TMP_DIR}/config.yaml"),
@@ -259,6 +380,9 @@ test -s {REMOTE_TMP_DIR}/config.yaml
     }
 
     patch_config_file_blocking(local_config, patched_config.clone()).await?;
+    if current_pulled.ok {
+        preserve_tun_config_file_blocking(current_config, patched_config.clone()).await?;
+    }
     let pushed = scp_to_remote_blocking(
         server,
         patched_config.clone(),
@@ -388,6 +512,175 @@ pub fn patch_config_yaml(content: &str) -> Result<String, String> {
     yaml_serde::to_string(&value).map_err(|err| err.to_string())
 }
 
+pub fn parse_tun_config_yaml(content: &str) -> Result<Option<TunConfig>, String> {
+    if content.trim().is_empty() {
+        return Ok(None);
+    }
+    let value: Value = yaml_serde::from_str(content).map_err(|err| err.to_string())?;
+    let Some(map) = value.as_mapping() else {
+        return Ok(None);
+    };
+    let Some(tun) = get_value(map, "tun") else {
+        return Ok(None);
+    };
+    let Some(tun_map) = tun.as_mapping() else {
+        return Ok(None);
+    };
+    let route_exclude_address = string_list(tun_map, "route-exclude-address")?;
+    let ssh_protection = route_exclude_address
+        .iter()
+        .filter(|value| is_ssh_safe_exclude(value))
+        .cloned()
+        .collect();
+
+    Ok(Some(TunConfig {
+        enabled: get_bool(tun_map, "enable").unwrap_or(false),
+        stack: get_string(tun_map, "stack"),
+        auto_route: get_bool(tun_map, "auto-route"),
+        auto_detect_interface: get_bool(tun_map, "auto-detect-interface"),
+        auto_redirect: get_bool(tun_map, "auto-redirect"),
+        dns_hijack: string_list(tun_map, "dns-hijack")?,
+        route_exclude_address,
+        ssh_protection,
+    }))
+}
+
+pub fn patch_tun_config_yaml(
+    content: &str,
+    enabled: bool,
+    ssh_excludes: &[String],
+) -> Result<String, String> {
+    let mut value: Value = yaml_serde::from_str(content).map_err(|err| err.to_string())?;
+    let map = value
+        .as_mapping_mut()
+        .ok_or_else(|| "mihomo config must be a YAML mapping".to_string())?;
+    let tun_key = Value::String("tun".to_string());
+    let tun_value = map
+        .entry(tun_key)
+        .or_insert_with(|| Value::Mapping(Mapping::new()));
+    if tun_value.as_mapping_mut().is_none() {
+        *tun_value = Value::Mapping(Mapping::new());
+    }
+    let tun_map = tun_value
+        .as_mapping_mut()
+        .ok_or_else(|| "tun config must be a YAML mapping".to_string())?;
+
+    put_bool(tun_map, "enable", enabled);
+    if enabled {
+        if get_string(tun_map, "stack").is_none() {
+            put_string(tun_map, "stack", "system");
+        }
+        put_bool(tun_map, "auto-route", true);
+        put_bool(tun_map, "auto-detect-interface", true);
+        if string_list(tun_map, "dns-hijack")?.is_empty() {
+            put_string_list(tun_map, "dns-hijack", &["any:53".to_string()]);
+        }
+        let mut excludes = string_list(tun_map, "route-exclude-address")?;
+        excludes.extend(BASE_TUN_EXCLUDES.iter().map(|value| (*value).to_string()));
+        excludes.extend(ssh_excludes.iter().cloned());
+        let excludes = normalize_excludes(excludes);
+        put_string_list(tun_map, "route-exclude-address", &excludes);
+    }
+
+    yaml_serde::to_string(&value).map_err(|err| err.to_string())
+}
+
+pub fn preserve_tun_config_yaml(current: &str, next: &str) -> Result<String, String> {
+    let current_value: Value = yaml_serde::from_str(current).map_err(|err| err.to_string())?;
+    let Some(current_map) = current_value.as_mapping() else {
+        return Ok(next.to_string());
+    };
+    let Some(tun) = get_value(current_map, "tun") else {
+        return Ok(next.to_string());
+    };
+
+    let mut next_value: Value = yaml_serde::from_str(next).map_err(|err| err.to_string())?;
+    let next_map = next_value
+        .as_mapping_mut()
+        .ok_or_else(|| "mihomo config must be a YAML mapping".to_string())?;
+    next_map.insert(Value::String("tun".to_string()), tun.clone());
+    yaml_serde::to_string(&next_value).map_err(|err| err.to_string())
+}
+
+async fn collect_ssh_tun_excludes(server: &Server) -> Result<Vec<String>, String> {
+    let output = run_ssh_script_blocking(
+        server,
+        r#"
+set +e
+emit_exclude() {
+  value="$1"
+  case "$value" in
+    *[!0-9A-Fa-f.:/]*|"") return ;;
+    *) printf 'EXCLUDE\t%s\n' "$value" ;;
+  esac
+}
+client_ip="$(printf '%s\n' "${SSH_CONNECTION:-}" | awk '{print $1}')"
+if [ -n "$client_ip" ]; then
+  case "$client_ip" in
+    *:*) emit_exclude "$client_ip/128" ;;
+    *) emit_exclude "$client_ip/32" ;;
+  esac
+  if command -v ip >/dev/null 2>&1; then
+    dev="$(ip -o route get "$client_ip" 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}')"
+    if [ -n "$dev" ]; then
+      ip -o -4 addr show dev "$dev" scope global 2>/dev/null | awk '{print "EXCLUDE\t"$4}'
+      ip -o -6 addr show dev "$dev" scope global 2>/dev/null | awk '{print "EXCLUDE\t"$4}'
+    fi
+  fi
+fi
+"#
+        .to_string(),
+        Duration::from_secs(20),
+    )
+    .await?;
+    if !output.ok {
+        return Err(output.stderr);
+    }
+    let excludes = output
+        .stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix("EXCLUDE\t"))
+        .map(str::trim)
+        .filter(|value| is_valid_route_exclude(value))
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    Ok(normalize_excludes(excludes))
+}
+
+fn get_value<'a>(map: &'a Mapping, key: &str) -> Option<&'a Value> {
+    map.get(&Value::String(key.to_string()))
+}
+
+fn get_string(map: &Mapping, key: &str) -> Option<String> {
+    get_value(map, key)
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+}
+
+fn get_bool(map: &Mapping, key: &str) -> Option<bool> {
+    get_value(map, key).and_then(Value::as_bool)
+}
+
+fn string_list(map: &Mapping, key: &str) -> Result<Vec<String>, String> {
+    let Some(value) = get_value(map, key) else {
+        return Ok(Vec::new());
+    };
+    let Some(items) = value.as_sequence() else {
+        return Err(format!("{key} must be a list"));
+    };
+    let mut values = Vec::new();
+    for item in items {
+        let Some(value) = item.as_str() else {
+            return Err(format!("{key} must contain only strings"));
+        };
+        let value = value.trim();
+        if !value.is_empty() {
+            values.push(value.to_string());
+        }
+    }
+    Ok(values)
+}
+
 fn put_number(map: &mut Mapping, key: &str, number: i64) {
     map.insert(
         Value::String(key.to_string()),
@@ -404,6 +697,38 @@ fn put_string(map: &mut Mapping, key: &str, value: &str) {
 
 fn put_bool(map: &mut Mapping, key: &str, value: bool) {
     map.insert(Value::String(key.to_string()), Value::Bool(value));
+}
+
+fn put_string_list(map: &mut Mapping, key: &str, values: &[String]) {
+    map.insert(
+        Value::String(key.to_string()),
+        Value::Sequence(values.iter().cloned().map(Value::String).collect()),
+    );
+}
+
+fn normalize_excludes(values: Vec<String>) -> Vec<String> {
+    let mut normalized = Vec::new();
+    for value in values {
+        let value = value.trim();
+        if is_valid_route_exclude(value) && !normalized.iter().any(|item| item == value) {
+            normalized.push(value.to_string());
+        }
+    }
+    normalized
+}
+
+fn is_valid_route_exclude(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 80
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_hexdigit() || matches!(ch, '.' | ':' | '/'))
+}
+
+fn is_ssh_safe_exclude(value: &str) -> bool {
+    BASE_TUN_EXCLUDES.iter().any(|item| value == *item)
+        || value.ends_with("/32")
+        || value.ends_with("/128")
 }
 
 #[derive(Debug, Deserialize)]
@@ -538,6 +863,30 @@ async fn patch_config_file_blocking(input: PathBuf, output: PathBuf) -> Result<(
     blocking(move || patch_config_file(&input, &output)).await
 }
 
+async fn patch_tun_config_file_blocking(
+    input: PathBuf,
+    output: PathBuf,
+    enabled: bool,
+    ssh_excludes: Vec<String>,
+) -> Result<(), String> {
+    blocking(move || {
+        let content = std::fs::read_to_string(&input).map_err(|err| err.to_string())?;
+        let patched = patch_tun_config_yaml(&content, enabled, &ssh_excludes)?;
+        std::fs::write(output, patched).map_err(|err| err.to_string())
+    })
+    .await
+}
+
+async fn preserve_tun_config_file_blocking(current: PathBuf, next: PathBuf) -> Result<(), String> {
+    blocking(move || {
+        let current_content = std::fs::read_to_string(current).map_err(|err| err.to_string())?;
+        let next_content = std::fs::read_to_string(&next).map_err(|err| err.to_string())?;
+        let patched = preserve_tun_config_yaml(&current_content, &next_content)?;
+        std::fs::write(next, patched).map_err(|err| err.to_string())
+    })
+    .await
+}
+
 async fn blocking<T, F>(operation: F) -> Result<T, String>
 where
     T: Send + 'static,
@@ -561,7 +910,10 @@ fn shell_safe_multiline(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{patch_config_yaml, verify_asset_digest};
+    use super::{
+        parse_tun_config_yaml, patch_config_yaml, patch_tun_config_yaml, preserve_tun_config_yaml,
+        verify_asset_digest,
+    };
 
     #[test]
     fn patches_required_keys_and_preserves_allow_lan() {
@@ -584,6 +936,86 @@ proxies: []
     fn defaults_allow_lan_to_false_when_missing() {
         let patched = patch_config_yaml("proxies: []").unwrap();
         assert!(patched.contains("allow-lan: false"));
+    }
+
+    #[test]
+    fn enables_tun_with_ssh_safe_excludes() {
+        let patched = patch_tun_config_yaml(
+            r#"
+mixed-port: 7890
+tun:
+  enable: false
+  route-exclude-address:
+    - 203.0.113.9/32
+proxies: []
+"#,
+            true,
+            &["10.40.2.10/32".to_string(), "10.40.2.39/24".to_string()],
+        )
+        .unwrap();
+        let tun = parse_tun_config_yaml(&patched).unwrap().unwrap();
+
+        assert!(tun.enabled);
+        assert_eq!(tun.stack.as_deref(), Some("system"));
+        assert_eq!(tun.auto_route, Some(true));
+        assert_eq!(tun.auto_detect_interface, Some(true));
+        assert!(tun
+            .route_exclude_address
+            .iter()
+            .any(|value| value == "10.40.2.10/32"));
+        assert!(tun
+            .route_exclude_address
+            .iter()
+            .any(|value| value == "10.0.0.0/8"));
+        assert!(tun
+            .route_exclude_address
+            .iter()
+            .any(|value| value == "203.0.113.9/32"));
+    }
+
+    #[test]
+    fn disables_tun_without_removing_existing_options() {
+        let patched = patch_tun_config_yaml(
+            r#"
+tun:
+  enable: true
+  stack: mixed
+  auto-route: true
+"#,
+            false,
+            &[],
+        )
+        .unwrap();
+        let tun = parse_tun_config_yaml(&patched).unwrap().unwrap();
+
+        assert!(!tun.enabled);
+        assert_eq!(tun.stack.as_deref(), Some("mixed"));
+        assert_eq!(tun.auto_route, Some(true));
+    }
+
+    #[test]
+    fn preserves_tun_when_subscription_config_is_replaced() {
+        let current = r#"
+mixed-port: 7890
+tun:
+  enable: true
+  stack: system
+  route-exclude-address:
+    - 10.40.2.10/32
+"#;
+        let next = r#"
+proxies: []
+rules:
+  - MATCH,DIRECT
+"#;
+        let patched = preserve_tun_config_yaml(current, next).unwrap();
+        let tun = parse_tun_config_yaml(&patched).unwrap().unwrap();
+
+        assert!(tun.enabled);
+        assert!(tun
+            .route_exclude_address
+            .iter()
+            .any(|value| value == "10.40.2.10/32"));
     }
 
     #[test]

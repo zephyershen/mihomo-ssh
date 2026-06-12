@@ -68,6 +68,8 @@ export const api = {
     }),
   setMihomoService: (serverId: number, serviceState: string) =>
     call<ServiceCommandResult>("set_mihomo_service", { serverId, serviceState }),
+  setMihomoTunEnabled: (serverId: number, enabled: boolean) =>
+    call<CommandResult>("set_mihomo_tun_enabled", { serverId, enabled }),
   inspectRemoteProxy: (serverId: number) =>
     call<RemoteProxyConfig>("inspect_remote_proxy", { serverId }),
   saveRemoteProxy: (serverId: number, input: RemoteProxyInput) =>
@@ -124,6 +126,8 @@ let mockRemoteProxy: RemoteProxyConfig = {
     { name: "no_proxy", value: "localhost,127.0.0.1,::1,10.40.2.0/24" },
   ],
 };
+
+let mockTunEnabled = false;
 
 let mockBackups: BackupSnapshot[] = [
   {
@@ -204,6 +208,18 @@ async function mockInvoke<T>(command: string, args?: Record<string, unknown>): P
     controller: "127.0.0.1:9090",
     allowLan: true,
     geoAutoUpdate: false,
+    tun: {
+      enabled: mockTunEnabled,
+      stack: mockTunEnabled ? "system" : null,
+      autoRoute: mockTunEnabled ? true : null,
+      autoDetectInterface: mockTunEnabled ? true : null,
+      autoRedirect: null,
+      dnsHijack: mockTunEnabled ? ["any:53"] : [],
+      routeExcludeAddress: mockTunEnabled
+        ? ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "10.40.2.10/32"]
+        : [],
+      sshProtection: mockTunEnabled ? ["10.40.2.10/32", "10.0.0.0/8"] : [],
+    },
     configPreview: "mixed-port: 7890\nallow-lan: true\nexternal-controller: 127.0.0.1:9090\n",
     checkedAt: new Date().toISOString(),
   };
@@ -240,6 +256,14 @@ async function mockInvoke<T>(command: string, args?: Record<string, unknown>): P
       return result as T;
     case "set_mihomo_service":
       return { state: args?.serviceState ?? "start", output: result } as T;
+    case "set_mihomo_tun_enabled":
+      mockTunEnabled = Boolean(args?.enabled);
+      return {
+        ok: true,
+        code: 0,
+        stdout: `tun ${mockTunEnabled ? "enabled" : "disabled"}`,
+        stderr: "",
+      } as T;
     case "inspect_remote_proxy":
       return mockRemoteProxy as T;
     case "save_remote_proxy": {

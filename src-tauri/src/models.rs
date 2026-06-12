@@ -71,8 +71,22 @@ pub struct ServerHealth {
     pub controller: Option<String>,
     pub allow_lan: Option<bool>,
     pub geo_auto_update: Option<bool>,
+    pub tun: Option<TunConfig>,
     pub config_preview: Option<String>,
     pub checked_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TunConfig {
+    pub enabled: bool,
+    pub stack: Option<String>,
+    pub auto_route: Option<bool>,
+    pub auto_detect_interface: Option<bool>,
+    pub auto_redirect: Option<bool>,
+    pub dns_hijack: Vec<String>,
+    pub route_exclude_address: Vec<String>,
+    pub ssh_protection: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

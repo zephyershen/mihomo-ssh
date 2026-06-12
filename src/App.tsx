@@ -21,6 +21,7 @@ import {
   Server as ServerIcon,
   Settings,
   ShieldAlert,
+  ShieldCheck,
   TerminalSquare,
   Trash2,
   UploadCloud,
@@ -309,6 +310,21 @@ export function App() {
     );
     if (result?.ok) {
       void refreshRemoteProxy(selected.id);
+      void refreshBackups(selected.id);
+    }
+  }
+
+  async function setTunState(enabled: boolean) {
+    if (!selected) return;
+    if (enabled) {
+      const confirmed = window.confirm("打开 TUN 会修改远端路由。软件会先备份并加入 SSH 保护，确认继续？");
+      if (!confirmed) return;
+    }
+    const result = await command(enabled ? "打开 TUN" : "关闭 TUN", () =>
+      api.setMihomoTunEnabled(selected.id, enabled),
+    );
+    if (result?.ok) {
+      void refreshHealth(selected.id);
       void refreshBackups(selected.id);
     }
   }
@@ -793,9 +809,9 @@ export function App() {
               selected={selected}
               health={health}
               busy={busy}
-              onStart={() => selected && command("启动代理", () => service(selected.id, "start"))}
-              onStop={() => selected && command("关闭代理", () => service(selected.id, "stop"))}
-              onRestart={() => selected && command("重启代理", () => service(selected.id, "restart"))}
+              onStart={() => selected && command("启动 mihomo", () => service(selected.id, "start"))}
+              onStop={() => selected && command("停止 mihomo", () => service(selected.id, "stop"))}
+              onRestart={() => selected && command("重启 mihomo", () => service(selected.id, "restart"))}
               egressUrl={egressUrl}
               setEgressUrl={setEgressUrl}
               egressResult={egressResult}
@@ -855,6 +871,7 @@ export function App() {
             <ConfigPanel
               selected={selected}
               busy={busy}
+              health={health}
               remoteProxy={remoteProxy}
               remoteProxyDraft={remoteProxyDraft}
               onProxyDraftChange={updateRemoteProxyDraft}
@@ -862,6 +879,8 @@ export function App() {
               onProxySave={saveRemoteProxyDraft}
               onProxyEnable={() => setRemoteProxyState(true)}
               onProxyDisable={() => setRemoteProxyState(false)}
+              onTunEnable={() => setTunState(true)}
+              onTunDisable={() => setTunState(false)}
             />
           )}
 
@@ -1103,19 +1122,19 @@ function OverviewPanel(props: {
       <Metric label="Controller" value={health?.controller ?? "missing"} tone={health?.controller ? "good" : "warn"} />
 
       <div className="wide-panel">
-        <div className="panel-title">Power</div>
+        <div className="panel-title">mihomo 服务</div>
         <div className="button-row">
-          <button className="command-button primary" disabled={!selected || !!busy} onClick={onStart}>
+          <button className="command-button primary" title="启动 mihomo 服务" disabled={!selected || !!busy} onClick={onStart}>
             <Power size={17} />
-            Start
+            启动
           </button>
-          <button className="command-button danger" disabled={!selected || !!busy} onClick={onStop}>
+          <button className="command-button danger" title="停止 mihomo 服务，不会关闭服务器" disabled={!selected || !!busy} onClick={onStop}>
             <PowerOff size={17} />
-            Stop
+            停止
           </button>
-          <button className="command-button" disabled={!selected || !!busy} onClick={onRestart}>
+          <button className="command-button" title="重启 mihomo 服务" disabled={!selected || !!busy} onClick={onRestart}>
             <RotateCw size={17} />
-            Restart
+            重启
           </button>
         </div>
       </div>
@@ -1446,6 +1465,7 @@ function NodesPanel(props: {
 function ConfigPanel(props: {
   selected: Server | null;
   busy: string | null;
+  health: ServerHealth | null;
   remoteProxy: RemoteProxyConfig | null;
   remoteProxyDraft: RemoteProxyInput;
   onProxyDraftChange: (field: keyof RemoteProxyInput, value: string | boolean) => void;
@@ -1453,11 +1473,20 @@ function ConfigPanel(props: {
   onProxySave: () => void;
   onProxyEnable: () => void;
   onProxyDisable: () => void;
+  onTunEnable: () => void;
+  onTunDisable: () => void;
 }) {
   const { selected } = props;
   return (
     <div className="config-page">
       <div className="work-panel">
+        <TunPanel
+          selected={selected}
+          busy={props.busy}
+          health={props.health}
+          onEnable={props.onTunEnable}
+          onDisable={props.onTunDisable}
+        />
         <RemoteProxyPanel
           selected={selected}
           busy={props.busy}
@@ -1469,6 +1498,71 @@ function ConfigPanel(props: {
           onEnable={props.onProxyEnable}
           onDisable={props.onProxyDisable}
         />
+      </div>
+    </div>
+  );
+}
+
+function TunPanel(props: {
+  selected: Server | null;
+  busy: string | null;
+  health: ServerHealth | null;
+  onEnable: () => void;
+  onDisable: () => void;
+}) {
+  const tun = props.health?.tun ?? null;
+  const status = tun?.enabled ? "已打开" : tun ? "已关闭" : "未读取";
+  const sshItems = tun?.sshProtection ?? [];
+  const routeItems = tun?.routeExcludeAddress ?? [];
+
+  return (
+    <div className="tun-panel">
+      <div className="section-heading">
+        <div>
+          <div className="panel-title">TUN 模式</div>
+          <div className={`proxy-status ${tun ? (tun.enabled ? "on" : "off") : ""}`}>
+            {status}
+            {tun?.enabled ? " · SSH 保护" : ""}
+          </div>
+        </div>
+        <ShieldCheck size={18} className={tun?.enabled ? "status-icon on" : "status-icon"} />
+      </div>
+
+      <div className="proxy-summary tun-summary">
+        <div className="proxy-summary-item">
+          <span>enable</span>
+          <strong>{tun ? String(tun.enabled) : "unknown"}</strong>
+        </div>
+        <div className="proxy-summary-item">
+          <span>stack</span>
+          <strong>{tun?.stack ?? "system"}</strong>
+        </div>
+        <div className="proxy-summary-item">
+          <span>auto-route</span>
+          <strong>{String(tun?.autoRoute ?? false)}</strong>
+        </div>
+        <div className="proxy-summary-item">
+          <span>排除地址</span>
+          <strong>{routeItems.length}</strong>
+        </div>
+      </div>
+
+      <div className="tun-protection">
+        {sshItems.slice(0, 8).map((item) => (
+          <span key={item}>{item}</span>
+        ))}
+        {!sshItems.length && <span>等待读取配置</span>}
+      </div>
+
+      <div className="button-row">
+        <button className="command-button primary" disabled={!props.selected || !!props.busy} onClick={props.onEnable}>
+          <Power size={17} />
+          打开 TUN
+        </button>
+        <button className="command-button danger" disabled={!props.selected || !!props.busy} onClick={props.onDisable}>
+          <PowerOff size={17} />
+          关闭 TUN
+        </button>
       </div>
     </div>
   );
@@ -1823,6 +1917,8 @@ function backupReasonLabel(reason: string): string {
     update_subscription: "订阅前",
     save_remote_proxy: "代理保存前",
     toggle_remote_proxy: "代理切换前",
+    enable_tun: "打开 TUN 前",
+    disable_tun: "关闭 TUN 前",
     pre_restore: "回滚前",
   };
   return labels[reason] ?? reason;
