@@ -1944,7 +1944,7 @@ dependencies = [
 
 [[package]]
 name = "mihomo-server-manager"
-version = "0.1.6"
+version = "0.1.10"
 dependencies = [
  "chrono",
  "flate2",

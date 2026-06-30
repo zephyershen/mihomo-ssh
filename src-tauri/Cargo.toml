@@ -1,6 +1,6 @@
 [package]
 name = "mihomo-server-manager"
-version = "0.1.6"
+version = "0.1.10"
 description = "Local desktop manager for mihomo on headless Linux servers."
 authors = ["Codex"]
 edition = "2021"

@@ -21,8 +21,13 @@ use crate::{
 };
 
 const MIHOMO_RELEASE_API: &str = "https://api.github.com/repos/MetaCubeX/mihomo/releases/latest";
+const GEOIP_METADB_URL: &str =
+    "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.metadb";
+const GEOSITE_DAT_URL: &str =
+    "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geosite.dat";
 const REMOTE_TMP_DIR: &str = "/tmp/mihomo-manager";
 const MAX_MIHOMO_ARCHIVE_BYTES: u64 = 80 * 1024 * 1024;
+const MAX_GEODATA_BYTES: u64 = 32 * 1024 * 1024;
 const BASE_TUN_EXCLUDES: &[&str] = &[
     "10.0.0.0/8",
     "100.64.0.0/10",
@@ -36,6 +41,18 @@ const BASE_TUN_EXCLUDES: &[&str] = &[
     "fe80::/10",
     "ff00::/8",
 ];
+
+#[derive(Clone, Copy)]
+enum SubscriptionDownloadMode {
+    Proxy,
+    Direct,
+}
+
+#[derive(Clone, Copy)]
+struct GeodataAsset {
+    file_name: &'static str,
+    url: &'static str,
+}
 
 pub async fn inspect_server(server: &Server) -> Result<ServerHealth, String> {
     let script = r#"
@@ -316,6 +333,21 @@ pub async fn update_subscription(
     server: &Server,
     options: SubscriptionUpdateOptions,
 ) -> Result<CommandResult, String> {
+    update_subscription_with_download_mode(server, options, SubscriptionDownloadMode::Proxy).await
+}
+
+pub async fn update_subscription_direct(
+    server: &Server,
+    options: SubscriptionUpdateOptions,
+) -> Result<CommandResult, String> {
+    update_subscription_with_download_mode(server, options, SubscriptionDownloadMode::Direct).await
+}
+
+async fn update_subscription_with_download_mode(
+    server: &Server,
+    options: SubscriptionUpdateOptions,
+    download_mode: SubscriptionDownloadMode,
+) -> Result<CommandResult, String> {
     if let Some(url) = options.subscription_url.as_deref() {
         if !url.trim().is_empty() {
             let script = format!(
@@ -329,6 +361,10 @@ pub async fn update_subscription(
         }
     }
 
+    let proxy_arg = match download_mode {
+        SubscriptionDownloadMode::Proxy => "  --proxy http://127.0.0.1:7890 \\\n",
+        SubscriptionDownloadMode::Direct => "",
+    };
     let download_script = format!(
         r#"
 set -euo pipefail
@@ -345,8 +381,7 @@ if printf '%s' "$sub" | grep -q '[[:space:][:cntrl:]]'; then
 fi
 curl -fsSL --connect-timeout 20 --max-time 90 --retry 2 \
   -A 'clash-verge' \
-  --proxy http://127.0.0.1:7890 \
-  -o {REMOTE_TMP_DIR}/config.yaml \
+{proxy_arg}  -o {REMOTE_TMP_DIR}/config.yaml \
   "$sub"
 test -s {REMOTE_TMP_DIR}/config.yaml
 "#
@@ -410,7 +445,19 @@ printf 'subscription updated at %s\n' "{updated_at}"
         updated_at = Utc::now().to_rfc3339()
     );
 
-    run_ssh_script_blocking(server, install_script, Duration::from_secs(90)).await
+    let mut installed =
+        run_ssh_script_blocking(server, install_script.clone(), Duration::from_secs(90)).await?;
+    if !installed.ok && has_geodata_download_error(&installed) {
+        let geodata = ensure_geodata_files(server, &installed).await?;
+        if geodata.ok {
+            let retry =
+                run_ssh_script_blocking(server, install_script, Duration::from_secs(90)).await?;
+            installed = merge_geodata_retry_result(installed, geodata, retry);
+        } else {
+            installed = merge_geodata_repair_failure(installed, geodata);
+        }
+    }
+    Ok(installed)
 }
 
 pub fn set_service(server: &Server, state: &str) -> Result<ServiceCommandResult, String> {
@@ -437,6 +484,165 @@ pub fn read_logs(server: &Server, lines: u32) -> Result<String, String> {
         Ok(output.stdout)
     } else {
         Err(output.stderr)
+    }
+}
+
+async fn ensure_geodata_files(
+    server: &Server,
+    failed: &CommandResult,
+) -> Result<CommandResult, String> {
+    let assets = geodata_assets_for_error(failed);
+    if assets.is_empty() {
+        return Ok(CommandResult {
+            ok: false,
+            code: None,
+            stdout: String::new(),
+            stderr: "no missing geodata asset was detected".to_string(),
+        });
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(120))
+        .build()
+        .map_err(|err| err.to_string())?;
+    let dir = tempdir().map_err(|err| err.to_string())?;
+
+    let prep = run_ssh_script_blocking(
+        server,
+        format!("set -euo pipefail\ninstall -d -m 0700 {REMOTE_TMP_DIR}"),
+        Duration::from_secs(20),
+    )
+    .await?;
+    if !prep.ok {
+        return Ok(prep);
+    }
+
+    for asset in &assets {
+        let local_path = dir.path().join(asset.file_name);
+        download_limited_file(&client, asset.url, &local_path, MAX_GEODATA_BYTES).await?;
+        let uploaded = scp_to_remote_blocking(
+            server,
+            local_path,
+            format!("{REMOTE_TMP_DIR}/{}", asset.file_name),
+            Duration::from_secs(90),
+        )
+        .await?;
+        if !uploaded.ok {
+            return Ok(uploaded);
+        }
+    }
+
+    let mut install_lines = String::new();
+    for asset in &assets {
+        install_lines.push_str(&format!(
+            r#"if [ -f /etc/mihomo/{file} ]; then
+  cp -a /etc/mihomo/{file} "/etc/mihomo/{file}.bak.${{ts}}"
+fi
+install -m 0644 {tmp}/{file} /etc/mihomo/{file}
+"#,
+            file = asset.file_name,
+            tmp = REMOTE_TMP_DIR
+        ));
+    }
+    let asset_names = assets
+        .iter()
+        .map(|asset| asset.file_name)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let script = format!(
+        r#"
+set -euo pipefail
+install -d -m 0755 /etc/mihomo
+ts="$(date +%Y%m%d%H%M%S)"
+{install_lines}
+printf 'geodata repaired: {asset_names}\n'
+"#
+    );
+    run_ssh_script_blocking(server, script, Duration::from_secs(30)).await
+}
+
+fn geodata_assets_for_error(result: &CommandResult) -> Vec<GeodataAsset> {
+    let text = format!("{}\n{}", result.stdout, result.stderr).to_ascii_lowercase();
+    let wants_geosite = text.contains("geosite");
+    let wants_geoip = text.contains("geoip") || text.contains("mmdb");
+
+    let mut assets = Vec::new();
+    if wants_geoip {
+        assets.push(GeodataAsset {
+            file_name: "geoip.metadb",
+            url: GEOIP_METADB_URL,
+        });
+    }
+    if wants_geosite {
+        assets.push(GeodataAsset {
+            file_name: "GeoSite.dat",
+            url: GEOSITE_DAT_URL,
+        });
+    }
+    assets
+}
+
+fn has_geodata_download_error(result: &CommandResult) -> bool {
+    !geodata_assets_for_error(result).is_empty()
+}
+
+fn merge_geodata_retry_result(
+    initial: CommandResult,
+    geodata: CommandResult,
+    retry: CommandResult,
+) -> CommandResult {
+    let initial_text = command_text(&initial);
+    let retry_text = command_text(&retry);
+    let stdout = if retry.ok {
+        format!(
+            "initial config test needed geodata; repaired and retried\n{}\n{}",
+            geodata.stdout.trim(),
+            retry_text.trim()
+        )
+    } else {
+        retry.stdout.clone()
+    };
+    let stderr = if retry.ok {
+        String::new()
+    } else {
+        format!(
+            "initial failure:\n{}\nretry failure:\n{}",
+            initial_text.trim(),
+            command_text(&retry).trim()
+        )
+    };
+
+    CommandResult {
+        ok: retry.ok,
+        code: retry.code,
+        stdout,
+        stderr,
+    }
+}
+
+fn merge_geodata_repair_failure(initial: CommandResult, geodata: CommandResult) -> CommandResult {
+    let initial_text = command_text(&initial);
+    let geodata_text = command_text(&geodata);
+    CommandResult {
+        ok: false,
+        code: geodata.code.or(initial.code),
+        stdout: initial.stdout,
+        stderr: format!(
+            "{}\ngeodata repair failed:\n{}",
+            initial_text.trim(),
+            geodata_text.trim()
+        ),
+    }
+}
+
+fn command_text(result: &CommandResult) -> String {
+    let stdout = result.stdout.trim();
+    let stderr = result.stderr.trim();
+    match (stdout.is_empty(), stderr.is_empty()) {
+        (true, true) => format!("exit={:?}", result.code),
+        (false, true) => stdout.to_string(),
+        (true, false) => stderr.to_string(),
+        (false, false) => format!("{stdout}\n{stderr}"),
     }
 }
 
@@ -807,6 +1013,34 @@ async fn download_asset(
     blocking(move || std::fs::write(path, bytes).map_err(|err| err.to_string())).await
 }
 
+async fn download_limited_file(
+    client: &reqwest::Client,
+    url: &str,
+    path: &Path,
+    max_bytes: u64,
+) -> Result<(), String> {
+    let response = client
+        .get(url)
+        .header("User-Agent", "mihomo-server-manager")
+        .send()
+        .await
+        .map_err(|err| err.to_string())?
+        .error_for_status()
+        .map_err(|err| err.to_string())?;
+    if let Some(length) = response.content_length() {
+        if length > max_bytes {
+            return Err(format!("download is too large: {length} bytes"));
+        }
+    }
+    let bytes = response.bytes().await.map_err(|err| err.to_string())?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(format!("download is too large: {} bytes", bytes.len()));
+    }
+
+    let path = path.to_path_buf();
+    blocking(move || std::fs::write(path, bytes).map_err(|err| err.to_string())).await
+}
+
 fn verify_asset_digest(expected: Option<&str>, bytes: &[u8]) -> Result<(), String> {
     let expected = expected.ok_or_else(|| "release asset is missing SHA256 digest".to_string())?;
     let Some(expected) = expected.strip_prefix("sha256:") else {
@@ -911,9 +1145,10 @@ fn shell_safe_multiline(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_tun_config_yaml, patch_config_yaml, patch_tun_config_yaml, preserve_tun_config_yaml,
-        verify_asset_digest,
+        geodata_assets_for_error, parse_tun_config_yaml, patch_config_yaml, patch_tun_config_yaml,
+        preserve_tun_config_yaml, verify_asset_digest,
     };
+    use crate::models::CommandResult;
 
     #[test]
     fn patches_required_keys_and_preserves_allow_lan() {
@@ -1025,5 +1260,21 @@ rules:
         assert!(verify_asset_digest(Some(empty_sha256), b"").is_ok());
         assert!(verify_asset_digest(Some(empty_sha256), b"changed").is_err());
         assert!(verify_asset_digest(None, b"").is_err());
+    }
+
+    #[test]
+    fn detects_missing_geodata_assets_from_mihomo_errors() {
+        let assets = geodata_assets_for_error(&CommandResult {
+            ok: false,
+            code: Some(1),
+            stdout: "can't initial GeoIP: can't download MMDB".to_string(),
+            stderr: "DNS FallbackGeosite[0] format error: can't download GeoSite.dat".to_string(),
+        });
+        let names = assets
+            .iter()
+            .map(|asset| asset.file_name)
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, vec!["geoip.metadb", "GeoSite.dat"]);
     }
 }

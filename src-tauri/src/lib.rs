@@ -19,10 +19,19 @@ use reqwest::Url;
 use storage::Storage;
 use tauri::{Manager, State};
 
+const BOOTSTRAP_SUBSCRIPTION_NAME: &str = "helium";
+
 pub struct AppState {
     storage: Storage,
     tunnels: controller::TunnelRegistry,
     app_dir: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BootstrapNodeCandidate {
+    group: String,
+    node: String,
+    preferred_region: bool,
 }
 
 #[tauri::command]
@@ -386,7 +395,31 @@ async fn install_or_repair_mihomo(
         Some("安装或修复前".to_string()),
     )
     .await?;
-    let result = mihomo::install_or_repair(&server, options).await?;
+    let update_options = SubscriptionUpdateOptions {
+        subscription_url: options.subscription_url.clone(),
+    };
+    let mut result = mihomo::install_or_repair(&server, options).await?;
+    if !result.ok && update_options.subscription_url.is_some() {
+        if let Some(bootstrap) =
+            find_bootstrap_subscription(&state.storage, update_options.subscription_url.as_deref())?
+        {
+            log_command(
+                &state.storage,
+                server_id,
+                "install_or_repair_initial",
+                &result,
+            )?;
+            result = retry_subscription_with_bootstrap(
+                &state,
+                &server,
+                server_id,
+                &update_options,
+                bootstrap,
+                result,
+            )
+            .await?;
+        }
+    }
     log_command(
         &state.storage,
         server_id,
@@ -414,7 +447,23 @@ async fn update_subscription(
         Some("更新订阅前".to_string()),
     )
     .await?;
-    let result = mihomo::update_subscription(&server, options).await?;
+    let mut result = mihomo::update_subscription(&server, options.clone()).await?;
+    if !result.ok {
+        if let Some(bootstrap) =
+            find_bootstrap_subscription(&state.storage, options.subscription_url.as_deref())?
+        {
+            log_command(
+                &state.storage,
+                server_id,
+                "update_subscription_initial",
+                &result,
+            )?;
+            result = retry_subscription_with_bootstrap(
+                &state, &server, server_id, &options, bootstrap, result,
+            )
+            .await?;
+        }
+    }
     log_command(&state.storage, server_id, "update_subscription", &result)?;
     Ok(result)
 }
@@ -689,6 +738,282 @@ fn ensure_tunnel(state: &State<'_, AppState>, server_id: i64) -> Result<u16, Str
     let server = state.storage.get_server(server_id)?;
     let info = state.tunnels.open(&server)?;
     Ok(info.local_port)
+}
+
+fn find_bootstrap_subscription(
+    storage: &Storage,
+    primary_url: Option<&str>,
+) -> Result<Option<SubscriptionProfile>, String> {
+    let primary_url = primary_url.map(str::trim).filter(|value| !value.is_empty());
+    Ok(storage.list_subscriptions()?.into_iter().find(|profile| {
+        profile
+            .name
+            .eq_ignore_ascii_case(BOOTSTRAP_SUBSCRIPTION_NAME)
+            && primary_url
+                .map(|url| profile.url.trim() != url)
+                .unwrap_or(true)
+    }))
+}
+
+async fn retry_subscription_with_bootstrap(
+    state: &State<'_, AppState>,
+    server: &Server,
+    server_id: i64,
+    options: &SubscriptionUpdateOptions,
+    bootstrap: SubscriptionProfile,
+    initial: CommandResult,
+) -> Result<CommandResult, String> {
+    let bootstrap_result = mihomo::update_subscription_direct(
+        server,
+        SubscriptionUpdateOptions {
+            subscription_url: Some(bootstrap.url),
+        },
+    )
+    .await?;
+    log_command(
+        &state.storage,
+        server_id,
+        "bootstrap_subscription",
+        &bootstrap_result,
+    )?;
+    if !bootstrap_result.ok {
+        return Ok(merge_bootstrap_failure(initial, bootstrap_result));
+    }
+
+    let selected = match select_bootstrap_node(state, server_id).await {
+        Ok(message) => {
+            state
+                .storage
+                .add_log(Some(server_id), "bootstrap_select_node", "ok", &message)?;
+            message
+        }
+        Err(err) => {
+            state
+                .storage
+                .add_log(Some(server_id), "bootstrap_select_node", "error", &err)?;
+            return Ok(merge_bootstrap_selection_failure(
+                initial,
+                bootstrap_result,
+                err,
+            ));
+        }
+    };
+
+    let retry = mihomo::update_subscription(server, options.clone()).await?;
+    Ok(merge_bootstrap_retry_result(
+        initial,
+        bootstrap_result,
+        &selected,
+        retry,
+    ))
+}
+
+async fn select_bootstrap_node(
+    state: &State<'_, AppState>,
+    server_id: i64,
+) -> Result<String, String> {
+    let port = ensure_tunnel(state, server_id)?;
+    let groups = controller::list_proxy_groups(port).await?;
+    let candidates = bootstrap_node_candidates(&groups);
+    if candidates.is_empty() {
+        return Err("helium 配置里没有可选的代理节点".to_string());
+    }
+
+    for candidate in candidates.iter().take(24) {
+        let measured = controller::measure_proxy_node_delay(port, &candidate.node).await?;
+        if measured.alive == Some(false) || measured.delay_ms.is_none() {
+            continue;
+        }
+
+        controller::select_proxy_node(port, &candidate.group, &candidate.node).await?;
+        let global = select_global_bootstrap_target(port, &groups, candidate).await?;
+        let delay = measured
+            .delay_ms
+            .map(|value| format!("{value}ms"))
+            .unwrap_or_else(|| "-".to_string());
+        return Ok(match global {
+            Some(global_target) => format!(
+                "selected {} in {}; GLOBAL -> {}; delay={delay}",
+                candidate.node, candidate.group, global_target
+            ),
+            None => format!(
+                "selected {} in {}; delay={delay}",
+                candidate.node, candidate.group
+            ),
+        });
+    }
+
+    Err("没有日本/新加坡或其它候选节点通过延迟测试".to_string())
+}
+
+async fn select_global_bootstrap_target(
+    port: u16,
+    groups: &[ProxyGroup],
+    candidate: &BootstrapNodeCandidate,
+) -> Result<Option<String>, String> {
+    if candidate.group.eq_ignore_ascii_case("GLOBAL") {
+        return Ok(Some(candidate.node.clone()));
+    }
+
+    let Some(global) = groups
+        .iter()
+        .find(|group| group.name.eq_ignore_ascii_case("GLOBAL"))
+    else {
+        return Ok(None);
+    };
+
+    if global.nodes.iter().any(|node| node.name == candidate.group) {
+        controller::select_proxy_node(port, &global.name, &candidate.group).await?;
+        return Ok(Some(candidate.group.clone()));
+    }
+    if global.nodes.iter().any(|node| node.name == candidate.node) {
+        controller::select_proxy_node(port, &global.name, &candidate.node).await?;
+        return Ok(Some(candidate.node.clone()));
+    }
+    Ok(None)
+}
+
+fn bootstrap_node_candidates(groups: &[ProxyGroup]) -> Vec<BootstrapNodeCandidate> {
+    let mut candidates = Vec::new();
+    for group in groups {
+        for node in &group.nodes {
+            if !is_leaf_proxy_node(node) {
+                continue;
+            }
+            candidates.push(BootstrapNodeCandidate {
+                group: group.name.clone(),
+                node: node.name.clone(),
+                preferred_region: is_preferred_bootstrap_region(&node.name),
+            });
+        }
+    }
+    candidates.sort_by_key(|candidate| {
+        (
+            !candidate.preferred_region,
+            candidate.group.eq_ignore_ascii_case("GLOBAL"),
+            candidate.group.to_ascii_lowercase(),
+            candidate.node.to_ascii_lowercase(),
+        )
+    });
+    candidates
+}
+
+fn is_leaf_proxy_node(node: &ProxyNode) -> bool {
+    let node_type = node
+        .node_type
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    !matches!(
+        node_type.as_str(),
+        "direct" | "reject" | "selector" | "urltest" | "fallback" | "loadbalance" | "relay"
+    )
+}
+
+fn is_preferred_bootstrap_region(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.contains("japan")
+        || lower.contains("tokyo")
+        || lower.contains("osaka")
+        || lower.contains("singapore")
+        || has_ascii_token(&lower, "jp")
+        || has_ascii_token(&lower, "sg")
+        || lower.contains("日本")
+        || lower.contains("东京")
+        || lower.contains("大阪")
+        || lower.contains("新加坡")
+        || lower.contains("狮城")
+}
+
+fn has_ascii_token(value: &str, token: &str) -> bool {
+    value
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .any(|part| part == token)
+}
+
+fn merge_bootstrap_failure(initial: CommandResult, bootstrap: CommandResult) -> CommandResult {
+    let initial_text = command_text(&initial);
+    let bootstrap_text = command_text(&bootstrap);
+    CommandResult {
+        ok: false,
+        code: bootstrap.code.or(initial.code),
+        stdout: initial.stdout,
+        stderr: format!(
+            "initial update failed:\n{}\nhelium bootstrap failed:\n{}",
+            initial_text.trim(),
+            bootstrap_text.trim()
+        ),
+    }
+}
+
+fn merge_bootstrap_selection_failure(
+    initial: CommandResult,
+    bootstrap: CommandResult,
+    selection_error: String,
+) -> CommandResult {
+    let initial_text = command_text(&initial);
+    CommandResult {
+        ok: false,
+        code: initial.code,
+        stdout: bootstrap.stdout,
+        stderr: format!(
+            "initial update failed:\n{}\nhelium bootstrap loaded, but node selection failed:\n{}",
+            initial_text.trim(),
+            selection_error
+        ),
+    }
+}
+
+fn merge_bootstrap_retry_result(
+    initial: CommandResult,
+    bootstrap: CommandResult,
+    selected: &str,
+    retry: CommandResult,
+) -> CommandResult {
+    if retry.ok {
+        let initial_text = command_text(&initial);
+        let bootstrap_text = command_text(&bootstrap);
+        let retry_text = command_text(&retry);
+        return CommandResult {
+            ok: true,
+            code: retry.code,
+            stdout: format!(
+                "initial update failed; helium bootstrap recovered the server\ninitial failure:\n{}\nhelium bootstrap:\n{}\n{}\nretry:\n{}",
+                initial_text.trim(),
+                bootstrap_text.trim(),
+                selected,
+                retry_text.trim()
+            ),
+            stderr: String::new(),
+        };
+    }
+
+    let initial_text = command_text(&initial);
+    let bootstrap_text = command_text(&bootstrap);
+    let retry_text = command_text(&retry);
+    CommandResult {
+        ok: false,
+        code: retry.code.or(initial.code),
+        stdout: retry.stdout,
+        stderr: format!(
+            "initial update failed:\n{}\nhelium bootstrap succeeded:\n{}\n{}\nretry failed:\n{}",
+            initial_text.trim(),
+            bootstrap_text.trim(),
+            selected,
+            retry_text.trim()
+        ),
+    }
+}
+
+fn command_text(result: &CommandResult) -> String {
+    let stdout = result.stdout.trim();
+    let stderr = result.stderr.trim();
+    match (stdout.is_empty(), stderr.is_empty()) {
+        (true, true) => format!("exit={:?}", result.code),
+        (false, true) => stdout.to_string(),
+        (true, false) => stderr.to_string(),
+        (false, false) => format!("{stdout}\n{stderr}"),
+    }
 }
 
 fn log_command(
@@ -1027,10 +1352,12 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        normalize_install_options, normalize_subscription_update_options, normalize_test_url,
-        parse_egress_output,
+        bootstrap_node_candidates, is_preferred_bootstrap_region, normalize_install_options,
+        normalize_subscription_update_options, normalize_test_url, parse_egress_output,
     };
-    use crate::models::{CommandResult, InstallOptions, SubscriptionUpdateOptions};
+    use crate::models::{
+        CommandResult, InstallOptions, ProxyGroup, ProxyNode, SubscriptionUpdateOptions,
+    };
 
     #[test]
     fn normalizes_external_test_urls() {
@@ -1084,5 +1411,59 @@ mod tests {
         assert!(result.ok);
         assert_eq!(result.status.as_deref(), Some("204"));
         assert_eq!(result.elapsed_ms, Some(153));
+    }
+
+    #[test]
+    fn prefers_japan_and_singapore_bootstrap_nodes() {
+        let groups = vec![
+            ProxyGroup {
+                name: "GLOBAL".to_string(),
+                now: Some("DIRECT".to_string()),
+                nodes: vec![
+                    proxy_node("DIRECT", "Direct"),
+                    proxy_node("自动选择", "URLTest"),
+                    proxy_node("US 01", "Trojan"),
+                ],
+            },
+            ProxyGroup {
+                name: "Cyber Paws".to_string(),
+                now: Some("自动选择".to_string()),
+                nodes: vec![
+                    proxy_node("自动选择", "URLTest"),
+                    proxy_node("JP 01", "Trojan"),
+                    proxy_node("Singapore 02", "Shadowsocks"),
+                    proxy_node("US 01", "Trojan"),
+                ],
+            },
+        ];
+
+        let candidates = bootstrap_node_candidates(&groups);
+
+        assert_eq!(candidates[0].group, "Cyber Paws");
+        assert_eq!(candidates[0].node, "JP 01");
+        assert!(candidates[0].preferred_region);
+        assert!(candidates
+            .iter()
+            .all(|candidate| candidate.node != "DIRECT"));
+        assert!(candidates
+            .iter()
+            .all(|candidate| candidate.node != "自动选择"));
+    }
+
+    #[test]
+    fn detects_short_region_tokens_for_bootstrap() {
+        assert!(is_preferred_bootstrap_region("sg-01"));
+        assert!(is_preferred_bootstrap_region("[JP] Tokyo"));
+        assert!(!is_preferred_bootstrap_region("spring-us"));
+    }
+
+    fn proxy_node(name: &str, node_type: &str) -> ProxyNode {
+        ProxyNode {
+            name: name.to_string(),
+            node_type: Some(node_type.to_string()),
+            udp: None,
+            delay_ms: None,
+            alive: None,
+        }
     }
 }
