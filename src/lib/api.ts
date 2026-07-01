@@ -87,6 +87,13 @@ export const api = {
     call<ProxyNode[]>("measure_proxy_delay", { serverId, group }),
   measureProxyNodeDelay: (serverId: number, node: string) =>
     call<ProxyNode>("measure_proxy_node_delay", { serverId, node }),
+  autoRecoverProxyNode: (serverId: number, group: string, currentNode: string, failedForSeconds: number) =>
+    call<ProxyGroup[]>("auto_recover_proxy_node", {
+      serverId,
+      group,
+      currentNode,
+      failedForSeconds,
+    }),
   readMihomoLogs: (serverId: number, lines = 200) =>
     call<string>("read_mihomo_logs", { serverId, lines }),
   readMihomoConfig: (serverId: number) => call<string>("read_mihomo_config", { serverId }),
@@ -317,6 +324,17 @@ async function mockInvoke<T>(command: string, args?: Record<string, unknown>): P
         delayMs: Math.round(80 + Math.random() * 220),
         alive: true,
       } as T;
+    case "auto_recover_proxy_node":
+      return [
+        {
+          name: String(args?.group ?? "Cyber Paws"),
+          now: "JP-02",
+          nodes: [
+            { name: "HK-01", nodeType: "ss", udp: true, delayMs: null, alive: false },
+            { name: "JP-02", nodeType: "trojan", udp: true, delayMs: 134, alive: true },
+          ],
+        },
+      ] as T;
     case "read_mihomo_logs":
       return "mihomo mock log line\nservice active\n" as T;
     case "read_mihomo_config":

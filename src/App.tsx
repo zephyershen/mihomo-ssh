@@ -68,6 +68,13 @@ type SubscriptionDraft = {
   name: string;
   url: string;
 };
+type NodeFailureState = {
+  serverId: number;
+  group: string;
+  node: string;
+  since: number;
+  recovering: boolean;
+};
 
 const emptySubscriptionDraft: SubscriptionDraft = {
   id: null,
@@ -82,6 +89,9 @@ const defaultRemoteProxyInput: RemoteProxyInput = {
   allProxy: "socks5h://127.0.0.1:7890",
   noProxy: "localhost,127.0.0.1,::1,10.40.2.0/24",
 };
+
+const NODE_MONITOR_INTERVAL_MS = 10_000;
+const NODE_FAILOVER_AFTER_MS = 30_000;
 
 const tabs: Array<{ id: Tab; label: string; icon: typeof Activity }> = [
   { id: "overview", label: "概览", icon: Gauge },
@@ -119,6 +129,7 @@ export function App() {
   const [groups, setGroups] = useState<ProxyGroup[]>([]);
   const [selectedGroup, setSelectedGroup] = useState<string>("");
   const [measuredNodes, setMeasuredNodes] = useState<ProxyNode[]>([]);
+  const [nodeMonitorStatus, setNodeMonitorStatus] = useState("节点监控待机");
   const [remoteProxy, setRemoteProxy] = useState<RemoteProxyConfig | null>(null);
   const [remoteProxyDraft, setRemoteProxyDraft] =
     useState<RemoteProxyInput>(defaultRemoteProxyInput);
@@ -131,15 +142,14 @@ export function App() {
   });
   const selectedIdRef = useRef<number | null>(selectedId);
   const selectedGroupRef = useRef(selectedGroup);
+  const selectedNodeNameRef = useRef<string | null>(null);
+  const nodeFailureRef = useRef<NodeFailureState | null>(null);
+  const nodeMonitorRunRef = useRef(0);
   const busyRunRef = useRef(0);
 
   const selected = useMemo(
     () => servers.find((server) => server.id === selectedId) ?? null,
     [servers, selectedId],
-  );
-  const selectedSubscription = useMemo(
-    () => subscriptions.find((subscription) => subscription.id === selectedSubscriptionId) ?? null,
-    [selectedSubscriptionId, subscriptions],
   );
 
   const loadServers = useCallback(async () => {
@@ -174,6 +184,8 @@ export function App() {
       setRemoteProxy(null);
       setRemoteProxyDraft(defaultRemoteProxyInput);
       setBackups([]);
+      setNodeMonitorStatus("节点监控待机");
+      nodeFailureRef.current = null;
       return;
     }
     setHealth(null);
@@ -184,6 +196,8 @@ export function App() {
     setRemoteProxy(null);
     setRemoteProxyDraft(defaultRemoteProxyInput);
     setBackups([]);
+    setNodeMonitorStatus("节点监控待机");
+    nodeFailureRef.current = null;
     void refreshHealth(selectedId);
     void refreshOperationLogs();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -438,6 +452,19 @@ export function App() {
     setSubscriptionDraft(draftFromSubscription(profile));
   }
 
+  async function selectSubscriptionProfileForServer(profile: SubscriptionProfile) {
+    selectSubscriptionProfile(profile);
+    if (!selected || health?.hasSubscription || busy) {
+      return;
+    }
+
+    const result = await command("更新订阅", () => api.updateSubscription(selected.id, profile.url));
+    if (result?.ok) {
+      void markSubscriptionUsed(profile.id);
+      void refreshBackups(selected.id);
+    }
+  }
+
   function newSubscriptionDraft() {
     setSelectedSubscriptionId(null);
     setSubscriptionDraft(emptySubscriptionDraft);
@@ -489,7 +516,6 @@ export function App() {
 
   async function refreshSubscriptionProfile(profile: SubscriptionProfile) {
     if (!selected) return;
-    selectSubscriptionProfile(profile);
     const result = await command("更新订阅", () => api.updateSubscription(selected.id, profile.url));
     if (result?.ok) {
       void markSubscriptionUsed(profile.id);
@@ -499,13 +525,7 @@ export function App() {
 
   async function installOrRepairSelected() {
     if (!selected) return;
-    const subscriptionUrl = subscriptionDraft.url.trim() || selectedSubscription?.url || "";
-    const result = await command("安装/修复 mihomo", () =>
-      api.installOrRepairMihomo(selected.id, subscriptionUrl),
-    );
-    if (result?.ok && subscriptionDraft.id) {
-      void markSubscriptionUsed(subscriptionDraft.id);
-    }
+    const result = await command("安装/修复 mihomo", () => api.installOrRepairMihomo(selected.id));
     if (result?.ok) {
       void refreshBackups(selected.id);
     }
@@ -656,6 +676,41 @@ export function App() {
     }
   }
 
+  async function autoRecoverNode(serverId: number, groupName: string, nodeName: string, failedForMs: number) {
+    const failedForSeconds = Math.max(30, Math.round(failedForMs / 1000));
+    setNodeMonitorStatus(`当前节点失效 ${failedForSeconds}s，正在切换`);
+    try {
+      const next = await api.autoRecoverProxyNode(serverId, groupName, nodeName, failedForSeconds);
+      if (
+        selectedIdRef.current !== serverId ||
+        selectedGroupRef.current !== groupName ||
+        selectedNodeNameRef.current !== nodeName
+      ) {
+        return;
+      }
+
+      const nextGroup = next.find((group) => group.name === groupName);
+      setGroups(next);
+      setMeasuredNodes([]);
+      nodeFailureRef.current = null;
+      const nextNode = nextGroup?.now ?? "新节点";
+      setNodeMonitorStatus(`已自动切换到 ${nextNode}`);
+      setToast(`节点连续失效，已自动切换到 ${nextNode}`);
+      void refreshOperationLogs();
+    } catch (error) {
+      const current = nodeFailureRef.current;
+      if (
+        current?.serverId === serverId &&
+        current.group === groupName &&
+        current.node === nodeName
+      ) {
+        nodeFailureRef.current = { ...current, since: Date.now(), recovering: false };
+      }
+      setNodeMonitorStatus(`自动切换失败：${String(error)}`);
+      void refreshOperationLogs();
+    }
+  }
+
   async function checkUpdates() {
     setUpdateProgress({ phase: "checking", message: "正在检查更新" });
     const result = await run("检查软件更新", checkForAppUpdate, (value) => {
@@ -689,6 +744,81 @@ export function App() {
     [currentGroup, measuredNodes],
   );
   const selectedNodeName = currentGroup?.now ?? null;
+
+  useEffect(() => {
+    selectedNodeNameRef.current = selectedNodeName;
+  }, [selectedNodeName]);
+
+  useEffect(() => {
+    nodeFailureRef.current = null;
+    setNodeMonitorStatus(selectedNodeName ? "节点监控运行中" : "节点监控待机");
+  }, [selected?.id, selectedGroup, selectedNodeName]);
+
+  useEffect(() => {
+    if (activeTab !== "nodes" || !selected?.id || !selectedGroup || !selectedNodeName || busy) {
+      return;
+    }
+
+    let disposed = false;
+    const runId = nodeMonitorRunRef.current + 1;
+    nodeMonitorRunRef.current = runId;
+    const serverId = selected.id;
+    const groupName = selectedGroup;
+    const nodeName = selectedNodeName;
+
+    async function checkCurrentNode() {
+      if (disposed || nodeMonitorRunRef.current !== runId) {
+        return;
+      }
+
+      try {
+        const result = await api.measureProxyNodeDelay(serverId, nodeName);
+        if (disposed || nodeMonitorRunRef.current !== runId) {
+          return;
+        }
+        setGroups((current) =>
+          current.map((group) =>
+            group.name === groupName ? { ...group, nodes: mergeNodeResult(group.nodes, result) } : group,
+          ),
+        );
+        setMeasuredNodes((current) => (current.length ? mergeNodeResult(current, result) : current));
+
+        if (result.alive === false) {
+          const now = Date.now();
+          const current = nodeFailureRef.current;
+          const failure =
+            current?.serverId === serverId && current.group === groupName && current.node === nodeName
+              ? current
+              : { serverId, group: groupName, node: nodeName, since: now, recovering: false };
+          const failedForMs = now - failure.since;
+          nodeFailureRef.current = failure;
+          setNodeMonitorStatus(`当前节点失效 ${Math.round(failedForMs / 1000)}s`);
+          if (failedForMs >= NODE_FAILOVER_AFTER_MS && !failure.recovering) {
+            nodeFailureRef.current = { ...failure, recovering: true };
+            void autoRecoverNode(serverId, groupName, nodeName, failedForMs);
+          }
+          return;
+        }
+
+        nodeFailureRef.current = null;
+        const delay = result.delayMs ? ` · ${result.delayMs} ms` : "";
+        setNodeMonitorStatus(`当前节点正常${delay}`);
+      } catch (error) {
+        if (!disposed) {
+          setNodeMonitorStatus(`节点监控失败：${String(error)}`);
+        }
+      }
+    }
+
+    const interval = window.setInterval(() => {
+      void checkCurrentNode();
+    }, NODE_MONITOR_INTERVAL_MS);
+    return () => {
+      disposed = true;
+      window.clearInterval(interval);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTab, selected?.id, selectedGroup, selectedNodeName, busy]);
 
   return (
     <div className="app-shell">
@@ -824,9 +954,6 @@ export function App() {
               selected={selected}
               health={health}
               busy={busy}
-              subscription={selectedSubscription}
-              subscriptionUrl={subscriptionDraft.url}
-              setSubscriptionUrl={(value) => updateSubscriptionDraft("url", value)}
               onInstall={installOrRepairSelected}
               onInspect={() => refreshHealth()}
             />
@@ -841,7 +968,7 @@ export function App() {
               selectedSubscriptionId={selectedSubscriptionId}
               draft={subscriptionDraft}
               onDraftChange={updateSubscriptionDraft}
-              onSelect={selectSubscriptionProfile}
+              onSelect={selectSubscriptionProfileForServer}
               onNew={newSubscriptionDraft}
               onSaveRefresh={saveAndRefreshSubscription}
               onRefreshProfile={refreshSubscriptionProfile}
@@ -858,6 +985,7 @@ export function App() {
               setSelectedGroup={changeSelectedGroup}
               nodes={displayedNodes}
               selectedNodeName={selectedNodeName}
+              monitorStatus={nodeMonitorStatus}
               onOpenTunnel={() => selected && run("打开控制通道", () => api.openControllerTunnel(selected.id))}
               onCloseTunnel={() => selected && run("关闭控制通道", () => api.closeControllerTunnel(selected.id))}
               onLoad={loadProxyGroups}
@@ -1186,9 +1314,6 @@ function InstallPanel(props: {
   selected: Server | null;
   health: ServerHealth | null;
   busy: string | null;
-  subscription: SubscriptionProfile | null;
-  subscriptionUrl: string;
-  setSubscriptionUrl: (value: string) => void;
   onInstall: () => void;
   onInspect: () => void;
 }) {
@@ -1196,14 +1321,6 @@ function InstallPanel(props: {
     <div className="single-layout">
       <div className="work-panel">
         <div className="panel-title">Install</div>
-        {props.subscription && (
-          <div className="active-subscription-line">
-            <CheckCircle2 size={15} />
-            <span>{props.subscription.name}</span>
-            <small>{subscriptionHost(props.subscription.url)}</small>
-          </div>
-        )}
-        <SecretInput value={props.subscriptionUrl} onChange={props.setSubscriptionUrl} />
         <div className="button-row">
           <button className="command-button primary" disabled={!props.selected || !!props.busy} onClick={props.onInstall}>
             <Download size={17} />
@@ -1359,6 +1476,7 @@ function NodesPanel(props: {
   setSelectedGroup: (value: string) => void;
   nodes: ProxyNode[];
   selectedNodeName: string | null;
+  monitorStatus: string;
   onOpenTunnel: () => void;
   onCloseTunnel: () => void;
   onLoad: () => void;
@@ -1396,6 +1514,9 @@ function NodesPanel(props: {
             </option>
           ))}
         </select>
+        <span className="node-monitor-status" title={props.monitorStatus}>
+          {props.monitorStatus}
+        </span>
       </div>
 
       <div className="table-wrap">

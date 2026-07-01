@@ -1157,6 +1157,23 @@ button:focus-visible {
   background: var(--panel);
 }
 
+.node-monitor-status {
+  min-width: 150px;
+  max-width: 260px;
+  height: 34px;
+  display: inline-flex;
+  align-items: center;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--muted);
+  background: var(--panel-strong);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+}
+
 table {
   width: 100%;
   border-collapse: collapse;
@@ -1250,6 +1267,10 @@ td:last-child {
 
 .op-status.error {
   color: #b91c1c;
+}
+
+.op-status.warning {
+  color: #b45309;
 }
 
 .op-action,

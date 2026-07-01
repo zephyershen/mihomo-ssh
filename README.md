@@ -49,8 +49,8 @@ git push origin main
 For a signed release with updater metadata, push a version tag after configuring the updater secrets:
 
 ```bash
-git tag v0.1.10
-git push origin v0.1.10
+git tag v0.1.11
+git push origin v0.1.11
 ```
 
 Required GitHub secrets for release updates:

@@ -385,9 +385,7 @@ async fn install_or_repair_mihomo(
     options: Option<InstallOptions>,
 ) -> Result<CommandResult, String> {
     let server = state.storage.get_server(server_id)?;
-    let options = normalize_install_options(options.unwrap_or(InstallOptions {
-        subscription_url: None,
-    }))?;
+    let _ = options;
     create_indexed_backup(
         state.storage.clone(),
         server.clone(),
@@ -395,31 +393,13 @@ async fn install_or_repair_mihomo(
         Some("安装或修复前".to_string()),
     )
     .await?;
-    let update_options = SubscriptionUpdateOptions {
-        subscription_url: options.subscription_url.clone(),
-    };
-    let mut result = mihomo::install_or_repair(&server, options).await?;
-    if !result.ok && update_options.subscription_url.is_some() {
-        if let Some(bootstrap) =
-            find_bootstrap_subscription(&state.storage, update_options.subscription_url.as_deref())?
-        {
-            log_command(
-                &state.storage,
-                server_id,
-                "install_or_repair_initial",
-                &result,
-            )?;
-            result = retry_subscription_with_bootstrap(
-                &state,
-                &server,
-                server_id,
-                &update_options,
-                bootstrap,
-                result,
-            )
-            .await?;
-        }
-    }
+    let result = mihomo::install_or_repair(
+        &server,
+        InstallOptions {
+            subscription_url: None,
+        },
+    )
+    .await?;
     log_command(
         &state.storage,
         server_id,
@@ -600,14 +580,7 @@ fn open_controller_tunnel(
     server_id: i64,
 ) -> Result<TunnelInfo, String> {
     let server = state.storage.get_server(server_id)?;
-    let info = state.tunnels.open(&server)?;
-    state.storage.add_log(
-        Some(server_id),
-        "open_controller_tunnel",
-        "ok",
-        &format!("local port {}", info.local_port),
-    )?;
-    Ok(info)
+    state.tunnels.open(&server)
 }
 
 #[tauri::command]
@@ -615,11 +588,7 @@ fn close_controller_tunnel(
     state: State<'_, AppState>,
     server_id: i64,
 ) -> Result<TunnelInfo, String> {
-    let info = state.tunnels.close(server_id)?;
-    state
-        .storage
-        .add_log(Some(server_id), "close_controller_tunnel", "ok", "closed")?;
-    Ok(info)
+    state.tunnels.close(server_id)
 }
 
 #[tauri::command]
@@ -628,14 +597,7 @@ async fn list_proxy_groups(
     server_id: i64,
 ) -> Result<Vec<ProxyGroup>, String> {
     let port = ensure_tunnel(&state, server_id)?;
-    let groups = controller::list_proxy_groups(port).await?;
-    state.storage.add_log(
-        Some(server_id),
-        "list_proxy_groups",
-        "ok",
-        &format!("loaded {} groups", groups.len()),
-    )?;
-    Ok(groups)
+    controller::list_proxy_groups(port).await
 }
 
 #[tauri::command]
@@ -647,12 +609,6 @@ async fn select_proxy_node(
 ) -> Result<Vec<ProxyGroup>, String> {
     let port = ensure_tunnel(&state, server_id)?;
     controller::select_proxy_node(port, &group, &node).await?;
-    state.storage.add_log(
-        Some(server_id),
-        "select_proxy_node",
-        "ok",
-        &format!("group={group}"),
-    )?;
     controller::list_proxy_groups(port).await
 }
 
@@ -663,18 +619,7 @@ async fn measure_proxy_delay(
     group: String,
 ) -> Result<Vec<ProxyNode>, String> {
     let port = ensure_tunnel(&state, server_id)?;
-    let nodes = controller::measure_proxy_delay(port, &group).await?;
-    let alive = nodes
-        .iter()
-        .filter(|node| node.alive != Some(false))
-        .count();
-    state.storage.add_log(
-        Some(server_id),
-        "measure_proxy_delay",
-        "ok",
-        &format!("group={group} nodes={} alive={alive}", nodes.len()),
-    )?;
-    Ok(nodes)
+    controller::measure_proxy_delay(port, &group).await
 }
 
 #[tauri::command]
@@ -684,23 +629,58 @@ async fn measure_proxy_node_delay(
     node: String,
 ) -> Result<ProxyNode, String> {
     let port = ensure_tunnel(&state, server_id)?;
-    let result = controller::measure_proxy_node_delay(port, &node).await?;
-    let status = if result.alive == Some(false) {
-        "error"
-    } else {
-        "ok"
-    };
-    let delay = result
-        .delay_ms
-        .map(|value| format!("{value}ms"))
-        .unwrap_or_else(|| "-".to_string());
+    controller::measure_proxy_node_delay(port, &node).await
+}
+
+#[tauri::command]
+async fn auto_recover_proxy_node(
+    state: State<'_, AppState>,
+    server_id: i64,
+    group: String,
+    current_node: String,
+    failed_for_seconds: u32,
+) -> Result<Vec<ProxyGroup>, String> {
+    let port = ensure_tunnel(&state, server_id)?;
+    let failed_for_seconds = failed_for_seconds.max(30);
     state.storage.add_log(
         Some(server_id),
-        "measure_proxy_node_delay",
-        status,
-        &format!("node={} delay={delay}", result.name),
+        "node_status",
+        "warning",
+        &format!("group={group} node={current_node} failed_for={failed_for_seconds}s"),
     )?;
-    Ok(result)
+
+    let groups = controller::list_proxy_groups(port).await?;
+    let candidates = recovery_node_candidates(&groups, &group, &current_node);
+    for candidate in candidates.iter().take(24) {
+        let measured = controller::measure_proxy_node_delay(port, &candidate.node).await?;
+        if measured.alive == Some(false) || measured.delay_ms.is_none() {
+            continue;
+        }
+
+        controller::select_proxy_node(port, &candidate.group, &candidate.node).await?;
+        let delay = measured
+            .delay_ms
+            .map(|value| format!("{value}ms"))
+            .unwrap_or_else(|| "-".to_string());
+        state.storage.add_log(
+            Some(server_id),
+            "auto_select_proxy_node",
+            "warning",
+            &format!(
+                "group={} from={} to={} delay={delay}",
+                candidate.group, current_node, candidate.node
+            ),
+        )?;
+        return controller::list_proxy_groups(port).await;
+    }
+
+    state.storage.add_log(
+        Some(server_id),
+        "auto_select_proxy_node",
+        "error",
+        &format!("group={group} from={current_node} no available foreign node"),
+    )?;
+    Err("当前节点连续失效，但没有找到可用的国外节点".to_string())
 }
 
 #[tauri::command]
@@ -898,6 +878,73 @@ fn bootstrap_node_candidates(groups: &[ProxyGroup]) -> Vec<BootstrapNodeCandidat
     candidates
 }
 
+fn recovery_node_candidates(
+    groups: &[ProxyGroup],
+    group_name: &str,
+    current_node: &str,
+) -> Vec<BootstrapNodeCandidate> {
+    let mut candidates =
+        recovery_node_candidates_with_mode(groups, group_name, current_node, false);
+    if candidates.is_empty() {
+        candidates = recovery_node_candidates_with_mode(groups, group_name, current_node, true);
+    }
+    candidates.sort_by_key(|candidate| {
+        (
+            !candidate.preferred_region,
+            candidate.group.to_ascii_lowercase(),
+            candidate.node.to_ascii_lowercase(),
+        )
+    });
+    candidates
+}
+
+fn recovery_node_candidates_with_mode(
+    groups: &[ProxyGroup],
+    group_name: &str,
+    current_node: &str,
+    allow_strategy_nodes: bool,
+) -> Vec<BootstrapNodeCandidate> {
+    groups
+        .iter()
+        .filter(|group| group.name == group_name)
+        .flat_map(|group| {
+            group.nodes.iter().filter_map(move |node| {
+                if node.name == current_node
+                    || !is_recovery_candidate_node(node, allow_strategy_nodes)
+                {
+                    return None;
+                }
+                Some(BootstrapNodeCandidate {
+                    group: group.name.clone(),
+                    node: node.name.clone(),
+                    preferred_region: is_preferred_bootstrap_region(&node.name),
+                })
+            })
+        })
+        .collect()
+}
+
+fn is_recovery_candidate_node(node: &ProxyNode, allow_strategy_nodes: bool) -> bool {
+    if is_management_node_name(&node.name) {
+        return false;
+    }
+
+    let node_type = node
+        .node_type
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if matches!(node_type.as_str(), "direct" | "reject") {
+        return false;
+    }
+    is_leaf_proxy_node(node)
+        || (allow_strategy_nodes
+            && matches!(
+                node_type.as_str(),
+                "selector" | "urltest" | "fallback" | "loadbalance"
+            ))
+}
+
 fn is_leaf_proxy_node(node: &ProxyNode) -> bool {
     let node_type = node
         .node_type
@@ -908,6 +955,18 @@ fn is_leaf_proxy_node(node: &ProxyNode) -> bool {
         node_type.as_str(),
         "direct" | "reject" | "selector" | "urltest" | "fallback" | "loadbalance" | "relay"
     )
+}
+
+fn is_management_node_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.contains("剩余流量")
+        || lower.contains("流量")
+        || lower.contains("套餐")
+        || lower.contains("到期")
+        || lower.contains("官网")
+        || lower.contains("traffic")
+        || lower.contains("expire")
+        || lower.contains("subscription")
 }
 
 fn is_preferred_bootstrap_region(name: &str) -> bool {
@@ -1144,11 +1203,6 @@ fn normalize_subscription_input(mut input: SubscriptionInput) -> Result<Subscrip
     Ok(input)
 }
 
-fn normalize_install_options(mut options: InstallOptions) -> Result<InstallOptions, String> {
-    options.subscription_url = normalize_optional_subscription_url(options.subscription_url)?;
-    Ok(options)
-}
-
 fn normalize_subscription_update_options(
     mut options: SubscriptionUpdateOptions,
 ) -> Result<SubscriptionUpdateOptions, String> {
@@ -1342,6 +1396,7 @@ pub fn run() {
             select_proxy_node,
             measure_proxy_delay,
             measure_proxy_node_delay,
+            auto_recover_proxy_node,
             read_mihomo_logs,
             read_mihomo_config
         ])
@@ -1352,12 +1407,11 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        bootstrap_node_candidates, is_preferred_bootstrap_region, normalize_install_options,
+        bootstrap_node_candidates, is_preferred_bootstrap_region,
         normalize_subscription_update_options, normalize_test_url, parse_egress_output,
+        recovery_node_candidates,
     };
-    use crate::models::{
-        CommandResult, InstallOptions, ProxyGroup, ProxyNode, SubscriptionUpdateOptions,
-    };
+    use crate::models::{CommandResult, ProxyGroup, ProxyNode, SubscriptionUpdateOptions};
 
     #[test]
     fn normalizes_external_test_urls() {
@@ -1375,7 +1429,7 @@ mod tests {
 
     #[test]
     fn validates_subscription_urls_for_remote_commands() {
-        let install = normalize_install_options(InstallOptions {
+        let install = normalize_subscription_update_options(SubscriptionUpdateOptions {
             subscription_url: Some(" https://example.com/sub ".to_string()),
         })
         .unwrap();
@@ -1390,10 +1444,12 @@ mod tests {
             })
             .is_err()
         );
-        assert!(normalize_install_options(InstallOptions {
-            subscription_url: Some("https://example.com/a b".to_string()),
-        })
-        .is_err());
+        assert!(
+            normalize_subscription_update_options(SubscriptionUpdateOptions {
+                subscription_url: Some("https://example.com/a b".to_string()),
+            })
+            .is_err()
+        );
     }
 
     #[test]
@@ -1455,6 +1511,32 @@ mod tests {
         assert!(is_preferred_bootstrap_region("sg-01"));
         assert!(is_preferred_bootstrap_region("[JP] Tokyo"));
         assert!(!is_preferred_bootstrap_region("spring-us"));
+    }
+
+    #[test]
+    fn recovery_candidates_skip_management_and_current_nodes() {
+        let groups = vec![ProxyGroup {
+            name: "Cyber Paws".to_string(),
+            now: Some("HK-01".to_string()),
+            nodes: vec![
+                proxy_node("HK-01", "Trojan"),
+                proxy_node("剩余流量：196 GB", "Trojan"),
+                proxy_node("DIRECT", "Direct"),
+                proxy_node("SG-02", "Shadowsocks"),
+                proxy_node("US-03", "Trojan"),
+            ],
+        }];
+
+        let candidates = recovery_node_candidates(&groups, "Cyber Paws", "HK-01");
+
+        assert_eq!(candidates[0].node, "SG-02");
+        assert!(candidates.iter().all(|candidate| candidate.node != "HK-01"));
+        assert!(candidates
+            .iter()
+            .all(|candidate| !candidate.node.contains("剩余流量")));
+        assert!(candidates
+            .iter()
+            .all(|candidate| candidate.node != "DIRECT"));
     }
 
     fn proxy_node(name: &str, node_type: &str) -> ProxyNode {
