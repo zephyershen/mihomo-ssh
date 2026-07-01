@@ -175,6 +175,14 @@ pub struct RemoteProxyInput {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct SharedRulesConfig {
+    pub remote_path: String,
+    pub rules: String,
+    pub applied_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CommandResult {
     pub ok: bool,
     pub code: Option<i32>,

@@ -15,7 +15,7 @@ use yaml_serde::{Mapping, Number, Value};
 use crate::{
     models::{
         CommandResult, InstallOptions, Server, ServerHealth, ServiceCommandResult,
-        SubscriptionUpdateOptions, TunConfig,
+        SharedRulesConfig, SubscriptionUpdateOptions, TunConfig,
     },
     ssh,
 };
@@ -28,6 +28,8 @@ const GEOSITE_DAT_URL: &str =
 const REMOTE_TMP_DIR: &str = "/tmp/mihomo-manager";
 const MAX_MIHOMO_ARCHIVE_BYTES: u64 = 80 * 1024 * 1024;
 const MAX_GEODATA_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_SHARED_RULES_BYTES: usize = 64 * 1024;
+const SHARED_RULES_PATH: &str = "/etc/mihomo/manager-shared-rules.txt";
 const BASE_TUN_EXCLUDES: &[&str] = &[
     "10.0.0.0/8",
     "100.64.0.0/10",
@@ -103,6 +105,131 @@ pub async fn read_remote_config(server: &Server) -> Result<String, String> {
     } else {
         Err(output.stderr)
     }
+}
+
+pub async fn read_shared_rules(server: &Server) -> Result<SharedRulesConfig, String> {
+    let rules = fetch_shared_rules_text(server).await?;
+    let rules = normalize_shared_rules_text(&rules)?;
+    Ok(SharedRulesConfig {
+        remote_path: SHARED_RULES_PATH.to_string(),
+        applied_count: active_shared_rule_lines(&rules)?.len(),
+        rules,
+    })
+}
+
+pub async fn save_shared_rules(server: &Server, rules: String) -> Result<CommandResult, String> {
+    let old_rules = fetch_shared_rules_text(server)
+        .await
+        .and_then(|rules| normalize_shared_rules_text(&rules))?;
+    let rules = normalize_shared_rules_text(&rules)?;
+    let applied_count = active_shared_rule_lines(&rules)?.len();
+
+    let dir = tempdir().map_err(|err| err.to_string())?;
+    let local_rules = dir.path().join("manager-shared-rules.txt");
+    let current_config = dir.path().join("config.current.yaml");
+    let patched_config = dir.path().join("config.shared-rules.yaml");
+    blocking({
+        let local_rules = local_rules.clone();
+        let rules = rules.clone();
+        move || std::fs::write(local_rules, rules).map_err(|err| err.to_string())
+    })
+    .await?;
+
+    let prep = run_ssh_script_blocking(
+        server,
+        format!(
+            r#"
+set -euo pipefail
+install -d -m 0755 /etc/mihomo
+install -d -m 0700 {REMOTE_TMP_DIR}
+if [ -f /etc/mihomo/config.yaml ]; then
+  printf 'has_config\n'
+fi
+"#
+        ),
+        Duration::from_secs(20),
+    )
+    .await?;
+    if !prep.ok {
+        return Ok(prep);
+    }
+
+    let pushed_rules = scp_to_remote_blocking(
+        server,
+        local_rules,
+        format!("{REMOTE_TMP_DIR}/manager-shared-rules.txt"),
+        Duration::from_secs(40),
+    )
+    .await?;
+    if !pushed_rules.ok {
+        return Ok(pushed_rules);
+    }
+
+    if !prep.stdout.lines().any(|line| line.trim() == "has_config") {
+        return run_ssh_script_blocking(
+            server,
+            format!(
+                r#"
+set -euo pipefail
+install -d -m 0755 /etc/mihomo
+install -m 0600 {REMOTE_TMP_DIR}/manager-shared-rules.txt {SHARED_RULES_PATH}
+rm -rf {REMOTE_TMP_DIR}
+printf 'shared rules saved: {applied_count} active rule(s); config missing, will apply on next subscription update\n'
+"#
+            ),
+            Duration::from_secs(30),
+        )
+        .await;
+    }
+
+    let pulled = scp_from_remote_blocking(
+        server,
+        "/etc/mihomo/config.yaml".to_string(),
+        current_config.clone(),
+        Duration::from_secs(40),
+    )
+    .await?;
+    if !pulled.ok {
+        return Ok(pulled);
+    }
+
+    patch_config_file_replacing_shared_rules_blocking(
+        current_config,
+        patched_config.clone(),
+        old_rules,
+        rules,
+    )
+    .await?;
+    let pushed_config = scp_to_remote_blocking(
+        server,
+        patched_config,
+        format!("{REMOTE_TMP_DIR}/config.shared-rules.yaml"),
+        Duration::from_secs(40),
+    )
+    .await?;
+    if !pushed_config.ok {
+        return Ok(pushed_config);
+    }
+
+    run_ssh_script_blocking(
+        server,
+        format!(
+            r#"
+set -euo pipefail
+ts="$(date +%Y%m%d%H%M%S)"
+/usr/local/bin/mihomo -t -d /etc/mihomo -f {REMOTE_TMP_DIR}/config.shared-rules.yaml
+cp -a /etc/mihomo/config.yaml "/etc/mihomo/config.yaml.shared-rules-bak.${{ts}}"
+install -m 0600 {REMOTE_TMP_DIR}/manager-shared-rules.txt {SHARED_RULES_PATH}
+install -m 0644 {REMOTE_TMP_DIR}/config.shared-rules.yaml /etc/mihomo/config.yaml
+systemctl restart mihomo
+rm -rf {REMOTE_TMP_DIR}
+printf 'shared rules saved and applied: {applied_count} active rule(s) at %s\n' "{updated_at}"
+"#,
+            updated_at = Utc::now().to_rfc3339()
+        ),
+        Duration::from_secs(90),
+    )
+    .await
 }
 
 pub async fn inspect_tun_config(server: &Server) -> Result<Option<TunConfig>, String> {
@@ -396,6 +523,7 @@ test -s {REMOTE_TMP_DIR}/config.yaml
     let local_config = dir.path().join("config.yaml");
     let current_config = dir.path().join("config.current.yaml");
     let patched_config = dir.path().join("config.patched.yaml");
+    let shared_rules = fetch_shared_rules_text(server).await?;
     let current_pulled = scp_from_remote_blocking(
         server,
         "/etc/mihomo/config.yaml".to_string(),
@@ -414,7 +542,12 @@ test -s {REMOTE_TMP_DIR}/config.yaml
         return Ok(pulled);
     }
 
-    patch_config_file_blocking(local_config, patched_config.clone()).await?;
+    patch_config_file_with_shared_rules_blocking(
+        local_config,
+        patched_config.clone(),
+        shared_rules,
+    )
+    .await?;
     if current_pulled.ok {
         preserve_tun_config_file_blocking(current_config, patched_config.clone()).await?;
     }
@@ -696,13 +829,28 @@ fn parse_bool(value: &str) -> Option<bool> {
     }
 }
 
-fn patch_config_file(input: &Path, output: &Path) -> Result<(), String> {
+fn patch_config_file_with_shared_rules(
+    input: &Path,
+    output: &Path,
+    shared_rules: &str,
+) -> Result<(), String> {
     let content = std::fs::read_to_string(input).map_err(|err| err.to_string())?;
-    let patched = patch_config_yaml(&content)?;
+    let patched = patch_config_yaml_with_shared_rules(&content, shared_rules)?;
     std::fs::write(output, patched).map_err(|err| err.to_string())
 }
 
-pub fn patch_config_yaml(content: &str) -> Result<String, String> {
+pub fn patch_config_yaml_with_shared_rules(
+    content: &str,
+    shared_rules: &str,
+) -> Result<String, String> {
+    patch_config_yaml_replacing_shared_rules(content, "", shared_rules)
+}
+
+pub fn patch_config_yaml_replacing_shared_rules(
+    content: &str,
+    old_shared_rules: &str,
+    new_shared_rules: &str,
+) -> Result<String, String> {
     let mut value: Value = yaml_serde::from_str(content).map_err(|err| err.to_string())?;
     let map = value
         .as_mapping_mut()
@@ -714,6 +862,8 @@ pub fn patch_config_yaml(content: &str) -> Result<String, String> {
     if !map.contains_key(&Value::String("allow-lan".to_string())) {
         put_bool(map, "allow-lan", false);
     }
+
+    replace_shared_rules(map, old_shared_rules, new_shared_rules)?;
 
     yaml_serde::to_string(&value).map_err(|err| err.to_string())
 }
@@ -912,6 +1062,84 @@ fn put_string_list(map: &mut Mapping, key: &str, values: &[String]) {
     );
 }
 
+fn replace_shared_rules(
+    map: &mut Mapping,
+    old_shared_rules: &str,
+    new_shared_rules: &str,
+) -> Result<(), String> {
+    let mut removable = active_shared_rule_lines(old_shared_rules)?;
+    for rule in active_shared_rule_lines(new_shared_rules)? {
+        if !removable.iter().any(|item| item == &rule) {
+            removable.push(rule);
+        }
+    }
+    let new_rules = active_shared_rule_lines(new_shared_rules)?;
+    if removable.is_empty() && new_rules.is_empty() {
+        return Ok(());
+    }
+
+    let rules_key = Value::String("rules".to_string());
+    let mut existing = match map.remove(&rules_key) {
+        Some(Value::Sequence(items)) => items,
+        Some(_) => return Err("rules must be a list".to_string()),
+        None => Vec::new(),
+    };
+    existing.retain(|item| match item.as_str() {
+        Some(rule) => !removable.iter().any(|value| value == rule.trim()),
+        None => true,
+    });
+
+    let mut rules = new_rules.into_iter().map(Value::String).collect::<Vec<_>>();
+    rules.extend(existing);
+    map.insert(rules_key, Value::Sequence(rules));
+    Ok(())
+}
+
+fn normalize_shared_rules_text(input: &str) -> Result<String, String> {
+    if input.len() > MAX_SHARED_RULES_BYTES {
+        return Err(format!(
+            "shared rules is too large: {} bytes, max {} bytes",
+            input.len(),
+            MAX_SHARED_RULES_BYTES
+        ));
+    }
+
+    let mut lines = Vec::new();
+    for line in input.replace("\r\n", "\n").replace('\r', "\n").lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line
+            .chars()
+            .any(|ch| ch.is_control() && !matches!(ch, '\t'))
+        {
+            return Err("shared rules cannot contain control characters".to_string());
+        }
+        lines.push(line.to_string());
+    }
+
+    if lines.is_empty() {
+        Ok(String::new())
+    } else {
+        Ok(format!("{}\n", lines.join("\n")))
+    }
+}
+
+fn active_shared_rule_lines(input: &str) -> Result<Vec<String>, String> {
+    let normalized = normalize_shared_rules_text(input)?;
+    let mut rules = Vec::new();
+    for line in normalized.lines() {
+        if line.starts_with('#') {
+            continue;
+        }
+        if !rules.iter().any(|item| item == line) {
+            rules.push(line.to_string());
+        }
+    }
+    Ok(rules)
+}
+
 fn normalize_excludes(values: Vec<String>) -> Vec<String> {
     let mut normalized = Vec::new();
     for value in values {
@@ -1060,6 +1288,20 @@ fn verify_asset_digest(expected: Option<&str>, bytes: &[u8]) -> Result<(), Strin
     }
 }
 
+async fn fetch_shared_rules_text(server: &Server) -> Result<String, String> {
+    let output = run_ssh_script_blocking(
+        server,
+        format!("test -f {SHARED_RULES_PATH} && cat {SHARED_RULES_PATH} || true"),
+        Duration::from_secs(20),
+    )
+    .await?;
+    if output.ok {
+        Ok(output.stdout)
+    } else {
+        Err(output.stderr)
+    }
+}
+
 async fn run_ssh_script_blocking(
     server: &Server,
     script: String,
@@ -1093,8 +1335,30 @@ async fn decompress_gzip_blocking(input: PathBuf, output: PathBuf) -> Result<(),
     blocking(move || decompress_gzip(&input, &output)).await
 }
 
-async fn patch_config_file_blocking(input: PathBuf, output: PathBuf) -> Result<(), String> {
-    blocking(move || patch_config_file(&input, &output)).await
+async fn patch_config_file_with_shared_rules_blocking(
+    input: PathBuf,
+    output: PathBuf,
+    shared_rules: String,
+) -> Result<(), String> {
+    blocking(move || patch_config_file_with_shared_rules(&input, &output, &shared_rules)).await
+}
+
+async fn patch_config_file_replacing_shared_rules_blocking(
+    input: PathBuf,
+    output: PathBuf,
+    old_shared_rules: String,
+    new_shared_rules: String,
+) -> Result<(), String> {
+    blocking(move || {
+        let content = std::fs::read_to_string(&input).map_err(|err| err.to_string())?;
+        let patched = patch_config_yaml_replacing_shared_rules(
+            &content,
+            &old_shared_rules,
+            &new_shared_rules,
+        )?;
+        std::fs::write(output, patched).map_err(|err| err.to_string())
+    })
+    .await
 }
 
 async fn patch_tun_config_file_blocking(
@@ -1145,19 +1409,21 @@ fn shell_safe_multiline(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        geodata_assets_for_error, parse_tun_config_yaml, patch_config_yaml, patch_tun_config_yaml,
-        preserve_tun_config_yaml, verify_asset_digest,
+        geodata_assets_for_error, parse_tun_config_yaml, patch_config_yaml_replacing_shared_rules,
+        patch_config_yaml_with_shared_rules, patch_tun_config_yaml, preserve_tun_config_yaml,
+        verify_asset_digest,
     };
     use crate::models::CommandResult;
 
     #[test]
     fn patches_required_keys_and_preserves_allow_lan() {
-        let patched = patch_config_yaml(
+        let patched = patch_config_yaml_with_shared_rules(
             r#"
 port: 7891
 allow-lan: true
 proxies: []
 "#,
+            "",
         )
         .unwrap();
 
@@ -1169,8 +1435,53 @@ proxies: []
 
     #[test]
     fn defaults_allow_lan_to_false_when_missing() {
-        let patched = patch_config_yaml("proxies: []").unwrap();
+        let patched = patch_config_yaml_with_shared_rules("proxies: []", "").unwrap();
         assert!(patched.contains("allow-lan: false"));
+    }
+
+    #[test]
+    fn prepends_shared_rules_and_deduplicates_existing_rules() {
+        let patched = patch_config_yaml_with_shared_rules(
+            r#"
+proxies: []
+rules:
+  - PROCESS-NAME,curl,DIRECT
+  - MATCH,GLOBAL
+"#,
+            r#"
+# local process rules
+PROCESS-NAME,curl,DIRECT
+IP-CIDR,1.1.1.1/32,DIRECT,no-resolve
+"#,
+        )
+        .unwrap();
+
+        let curl = patched.find("PROCESS-NAME,curl,DIRECT").unwrap();
+        let ip = patched
+            .find("IP-CIDR,1.1.1.1/32,DIRECT,no-resolve")
+            .unwrap();
+        let matched = patched.find("MATCH,GLOBAL").unwrap();
+        assert!(curl < matched);
+        assert!(ip < matched);
+        assert_eq!(patched.matches("PROCESS-NAME,curl,DIRECT").count(), 1);
+    }
+
+    #[test]
+    fn replaces_old_shared_rules_when_saving_new_rules() {
+        let patched = patch_config_yaml_replacing_shared_rules(
+            r#"
+proxies: []
+rules:
+  - PROCESS-NAME,curl,DIRECT
+  - MATCH,GLOBAL
+"#,
+            "PROCESS-NAME,curl,DIRECT\n",
+            "",
+        )
+        .unwrap();
+
+        assert!(!patched.contains("PROCESS-NAME,curl,DIRECT"));
+        assert!(patched.contains("MATCH,GLOBAL"));
     }
 
     #[test]

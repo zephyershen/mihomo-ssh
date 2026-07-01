@@ -563,6 +563,7 @@ pre {
 }
 
 .tun-panel,
+.shared-rules-panel,
 .remote-proxy-panel {
   display: grid;
   gap: 16px;
@@ -643,6 +644,42 @@ pre {
   font-family: "Cascadia Code", "Fira Code", Consolas, monospace;
   font-size: 12px;
   font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.shared-rules-editor {
+  width: 100%;
+  min-height: 190px;
+  max-height: 320px;
+  resize: vertical;
+  padding: 11px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--text);
+  background: var(--panel-strong);
+  font-family: "Cascadia Code", "Fira Code", Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.55;
+  outline: none;
+}
+
+.shared-rules-editor:focus {
+  border-color: var(--primary);
+  background: var(--panel);
+}
+
+.shared-rules-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.shared-rules-footer span {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 12px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -1346,5 +1383,10 @@ td:last-child {
   .tun-summary,
   .proxy-field-grid {
     grid-template-columns: 1fr;
+  }
+
+  .shared-rules-footer {
+    align-items: stretch;
+    flex-direction: column;
   }
 }

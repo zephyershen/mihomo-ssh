@@ -547,6 +547,20 @@ impl Storage {
                 .map_err(|err| err.to_string())
         }
     }
+
+    pub fn clear_logs(&self, server_id: Option<i64>) -> Result<usize, String> {
+        let conn = self.connect()?;
+        if let Some(server_id) = server_id {
+            conn.execute(
+                "DELETE FROM operation_logs WHERE server_id = ?1",
+                params![server_id],
+            )
+            .map_err(|err| err.to_string())
+        } else {
+            conn.execute("DELETE FROM operation_logs", [])
+                .map_err(|err| err.to_string())
+        }
+    }
 }
 
 fn add_column_if_missing(

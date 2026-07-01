@@ -14,6 +14,7 @@ import type {
   ServerBootstrapInput,
   ServerHealth,
   ServiceCommandResult,
+  SharedRulesConfig,
   SubscriptionInput,
   SubscriptionProfile,
   TunnelInfo,
@@ -38,6 +39,8 @@ export const api = {
   deleteServer: (serverId: number) => call<Server[]>("delete_server", { serverId }),
   listOperationLogs: (serverId?: number, limit = 120) =>
     call<OperationLog[]>("list_operation_logs", { serverId, limit }),
+  clearOperationLogs: (serverId?: number | null) =>
+    call<number>("clear_operation_logs", { serverId: serverId ?? null }),
   listBackups: (serverId: number) => call<BackupSnapshot[]>("list_backups", { serverId }),
   createBackup: (serverId: number, label?: string) =>
     call<BackupSnapshot>("create_backup", { serverId, label: label || null }),
@@ -97,6 +100,10 @@ export const api = {
   readMihomoLogs: (serverId: number, lines = 200) =>
     call<string>("read_mihomo_logs", { serverId, lines }),
   readMihomoConfig: (serverId: number) => call<string>("read_mihomo_config", { serverId }),
+  readSharedRules: (serverId: number) =>
+    call<SharedRulesConfig>("read_shared_rules", { serverId }),
+  saveSharedRules: (serverId: number, rules: string) =>
+    call<CommandResult>("save_shared_rules", { serverId, rules }),
 };
 
 let mockSubscriptions: SubscriptionProfile[] = [
@@ -135,6 +142,11 @@ let mockRemoteProxy: RemoteProxyConfig = {
 };
 
 let mockTunEnabled = false;
+let mockSharedRules: SharedRulesConfig = {
+  remotePath: "/etc/mihomo/manager-shared-rules.txt",
+  rules: "PROCESS-NAME,curl,DIRECT\nIP-CIDR,1.1.1.1/32,DIRECT,no-resolve\n",
+  appliedCount: 2,
+};
 
 let mockBackups: BackupSnapshot[] = [
   {
@@ -339,6 +351,30 @@ async function mockInvoke<T>(command: string, args?: Record<string, unknown>): P
       return "mihomo mock log line\nservice active\n" as T;
     case "read_mihomo_config":
       return sampleHealth.configPreview as T;
+    case "read_shared_rules":
+      return mockSharedRules as T;
+    case "save_shared_rules": {
+      const rules = String(args?.rules ?? "")
+        .replace(/\r\n/g, "\n")
+        .replace(/\r/g, "\n")
+        .split("\n")
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .join("\n");
+      mockSharedRules = {
+        remotePath: "/etc/mihomo/manager-shared-rules.txt",
+        rules: rules ? `${rules}\n` : "",
+        appliedCount: rules
+          ? rules.split("\n").filter((line) => !line.startsWith("#")).length
+          : 0,
+      };
+      return {
+        ok: true,
+        code: 0,
+        stdout: `shared rules saved and applied: ${mockSharedRules.appliedCount} active rule(s)`,
+        stderr: "",
+      } as T;
+    }
     case "list_operation_logs":
       return [
         {
@@ -350,6 +386,8 @@ async function mockInvoke<T>(command: string, args?: Record<string, unknown>): P
           createdAt: new Date().toISOString(),
         },
       ] as T;
+    case "clear_operation_logs":
+      return 1 as T;
     case "list_backups":
       return mockBackups.filter((backup) => backup.serverId === args?.serverId) as T;
     case "create_backup": {

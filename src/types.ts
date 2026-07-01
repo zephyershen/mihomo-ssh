@@ -166,3 +166,9 @@ export type RemoteProxyInput = {
   allProxy: string;
   noProxy: string;
 };
+
+export type SharedRulesConfig = {
+  remotePath: string;
+  rules: string;
+  appliedCount: number;
+};

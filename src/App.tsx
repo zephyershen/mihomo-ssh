@@ -51,6 +51,7 @@ import type {
   Server,
   ServerBootstrapInput,
   ServerHealth,
+  SharedRulesConfig,
   SubscriptionInput,
   SubscriptionProfile,
 } from "./types";
@@ -133,6 +134,8 @@ export function App() {
   const [remoteProxy, setRemoteProxy] = useState<RemoteProxyConfig | null>(null);
   const [remoteProxyDraft, setRemoteProxyDraft] =
     useState<RemoteProxyInput>(defaultRemoteProxyInput);
+  const [sharedRules, setSharedRules] = useState<SharedRulesConfig | null>(null);
+  const [sharedRulesDraft, setSharedRulesDraft] = useState("");
   const [backups, setBackups] = useState<BackupSnapshot[]>([]);
   const [operationLogs, setOperationLogs] = useState<OperationLog[]>([]);
   const [updateStatus, setUpdateStatus] = useState<AppUpdateStatus | null>(null);
@@ -183,6 +186,8 @@ export function App() {
       setEgressResult(null);
       setRemoteProxy(null);
       setRemoteProxyDraft(defaultRemoteProxyInput);
+      setSharedRules(null);
+      setSharedRulesDraft("");
       setBackups([]);
       setNodeMonitorStatus("节点监控待机");
       nodeFailureRef.current = null;
@@ -195,6 +200,8 @@ export function App() {
     setEgressResult(null);
     setRemoteProxy(null);
     setRemoteProxyDraft(defaultRemoteProxyInput);
+    setSharedRules(null);
+    setSharedRulesDraft("");
     setBackups([]);
     setNodeMonitorStatus("节点监控待机");
     nodeFailureRef.current = null;
@@ -212,6 +219,7 @@ export function App() {
       return;
     }
     void refreshRemoteProxy(selectedId);
+    void refreshSharedRules(selectedId);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeTab, selectedId]);
 
@@ -284,6 +292,15 @@ export function App() {
     }
   }
 
+  async function refreshSharedRules(id = selectedId) {
+    if (!id) return;
+    const next = await run("读取共享规则", () => api.readSharedRules(id));
+    if (next && selectedIdRef.current === id) {
+      setSharedRules(next);
+      setSharedRulesDraft(next.rules);
+    }
+  }
+
   async function refreshBackups(id = selectedId) {
     if (!id) return;
     const next = await run("读取备份", () => api.listBackups(id));
@@ -325,6 +342,28 @@ export function App() {
     if (result?.ok) {
       void refreshRemoteProxy(selected.id);
       void refreshBackups(selected.id);
+    }
+  }
+
+  async function saveSharedRulesDraft() {
+    if (!selected) return;
+    const result = await command("保存共享规则", () =>
+      api.saveSharedRules(selected.id, sharedRulesDraft),
+    );
+    if (result?.ok) {
+      void refreshSharedRules(selected.id);
+      void refreshHealth(selected.id);
+      void refreshBackups(selected.id);
+    }
+  }
+
+  async function clearOperationLogs() {
+    const confirmed = window.confirm("清空操作记录？");
+    if (!confirmed) return;
+    const removed = await run("清空操作记录", () => api.clearOperationLogs(null));
+    if (typeof removed === "number") {
+      setOperationLogs([]);
+      setToast(`清空操作记录完成：删除 ${removed} 条`);
     }
   }
 
@@ -1002,11 +1041,16 @@ export function App() {
               health={health}
               remoteProxy={remoteProxy}
               remoteProxyDraft={remoteProxyDraft}
+              sharedRules={sharedRules}
+              sharedRulesDraft={sharedRulesDraft}
               onProxyDraftChange={updateRemoteProxyDraft}
               onProxyRead={() => refreshRemoteProxy()}
               onProxySave={saveRemoteProxyDraft}
               onProxyEnable={() => setRemoteProxyState(true)}
               onProxyDisable={() => setRemoteProxyState(false)}
+              onSharedRulesDraftChange={setSharedRulesDraft}
+              onSharedRulesRead={() => refreshSharedRules()}
+              onSharedRulesSave={saveSharedRulesDraft}
               onTunEnable={() => setTunState(true)}
               onTunDisable={() => setTunState(false)}
             />
@@ -1030,6 +1074,7 @@ export function App() {
               busy={busy}
               operationLogs={operationLogs}
               onReadOps={() => refreshOperationLogs()}
+              onClearOps={clearOperationLogs}
             />
           )}
 
@@ -1589,11 +1634,16 @@ function ConfigPanel(props: {
   health: ServerHealth | null;
   remoteProxy: RemoteProxyConfig | null;
   remoteProxyDraft: RemoteProxyInput;
+  sharedRules: SharedRulesConfig | null;
+  sharedRulesDraft: string;
   onProxyDraftChange: (field: keyof RemoteProxyInput, value: string | boolean) => void;
   onProxyRead: () => void;
   onProxySave: () => void;
   onProxyEnable: () => void;
   onProxyDisable: () => void;
+  onSharedRulesDraftChange: (value: string) => void;
+  onSharedRulesRead: () => void;
+  onSharedRulesSave: () => void;
   onTunEnable: () => void;
   onTunDisable: () => void;
 }) {
@@ -1608,6 +1658,15 @@ function ConfigPanel(props: {
           onEnable={props.onTunEnable}
           onDisable={props.onTunDisable}
         />
+        <SharedRulesPanel
+          selected={selected}
+          busy={props.busy}
+          config={props.sharedRules}
+          draft={props.sharedRulesDraft}
+          onDraftChange={props.onSharedRulesDraftChange}
+          onRead={props.onSharedRulesRead}
+          onSave={props.onSharedRulesSave}
+        />
         <RemoteProxyPanel
           selected={selected}
           busy={props.busy}
@@ -1619,6 +1678,61 @@ function ConfigPanel(props: {
           onEnable={props.onProxyEnable}
           onDisable={props.onProxyDisable}
         />
+      </div>
+    </div>
+  );
+}
+
+function SharedRulesPanel(props: {
+  selected: Server | null;
+  busy: string | null;
+  config: SharedRulesConfig | null;
+  draft: string;
+  onDraftChange: (value: string) => void;
+  onRead: () => void;
+  onSave: () => void;
+}) {
+  const lineCount = props.draft
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line && !line.startsWith("#")).length;
+  const path = props.config?.remotePath ?? "/etc/mihomo/manager-shared-rules.txt";
+
+  return (
+    <div className="shared-rules-panel">
+      <div className="section-heading">
+        <div>
+          <div className="panel-title">共享规则</div>
+          <div className="proxy-status">
+            {props.config ? `${props.config.appliedCount} 条已保存` : "未读取"} · {path}
+          </div>
+        </div>
+        <button className="icon-button" title="读取共享规则" disabled={!props.selected || !!props.busy} onClick={props.onRead}>
+          <RefreshCcw size={16} />
+        </button>
+      </div>
+
+      <textarea
+        className="shared-rules-editor"
+        value={props.draft}
+        spellCheck={false}
+        placeholder={"PROCESS-NAME,curl,DIRECT\nIP-CIDR,1.1.1.1/32,DIRECT,no-resolve\nDOMAIN-SUFFIX,example.com,GLOBAL"}
+        disabled={!props.selected || !!props.busy}
+        onChange={(event) => props.onDraftChange(event.target.value)}
+      />
+
+      <div className="shared-rules-footer">
+        <span>{lineCount} 条将写入当前配置</span>
+        <div className="button-row">
+          <button className="command-button" disabled={!props.selected || !!props.busy} onClick={props.onRead}>
+            <RefreshCcw size={17} />
+            读取
+          </button>
+          <button className="command-button primary" disabled={!props.selected || !!props.busy} onClick={props.onSave}>
+            <Save size={17} />
+            保存并应用
+          </button>
+        </div>
       </div>
     </div>
   );
@@ -1899,6 +2013,7 @@ function LogsPanel(props: {
   busy: string | null;
   operationLogs: OperationLog[];
   onReadOps: () => void;
+  onClearOps: () => void;
 }) {
   const rows = useMemo(
     () =>
@@ -1918,10 +2033,16 @@ function LogsPanel(props: {
             <div className="panel-title">操作记录</div>
             <div className="proxy-status">每次操作和结果都会保留在这里，方便排查问题。</div>
           </div>
-          <button className="command-button" disabled={!props.selected || !!props.busy} onClick={props.onReadOps}>
-            <RefreshCcw size={17} />
-            刷新记录
-          </button>
+          <div className="button-row">
+            <button className="command-button" disabled={!props.selected || !!props.busy} onClick={props.onReadOps}>
+              <RefreshCcw size={17} />
+              刷新记录
+            </button>
+            <button className="command-button danger" disabled={!!props.busy || !props.operationLogs.length} onClick={props.onClearOps}>
+              <Trash2 size={17} />
+              清空
+            </button>
+          </div>
         </div>
         <div className="ops-list">
           {rows.map((log) => (

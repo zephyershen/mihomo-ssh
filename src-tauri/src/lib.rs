@@ -12,8 +12,8 @@ use std::{path::PathBuf, time::Duration};
 use models::{
     BackupSnapshot, CommandResult, EgressTestResult, InstallOptions, ManagedSshKeyInfo,
     ManualServerInput, OperationLog, ProxyGroup, ProxyNode, RemoteProxyConfig, RemoteProxyInput,
-    Server, ServerBootstrapInput, ServerHealth, ServiceCommandResult, SubscriptionInput,
-    SubscriptionProfile, SubscriptionUpdateOptions, TunnelInfo,
+    Server, ServerBootstrapInput, ServerHealth, ServiceCommandResult, SharedRulesConfig,
+    SubscriptionInput, SubscriptionProfile, SubscriptionUpdateOptions, TunnelInfo,
 };
 use reqwest::Url;
 use storage::Storage;
@@ -154,6 +154,14 @@ fn list_operation_logs(
     limit: Option<u32>,
 ) -> Result<Vec<OperationLog>, String> {
     state.storage.list_logs(server_id, limit.unwrap_or(120))
+}
+
+#[tauri::command]
+fn clear_operation_logs(
+    state: State<'_, AppState>,
+    server_id: Option<i64>,
+) -> Result<usize, String> {
+    state.storage.clear_logs(server_id)
 }
 
 #[tauri::command]
@@ -709,6 +717,34 @@ async fn read_mihomo_logs(
 async fn read_mihomo_config(state: State<'_, AppState>, server_id: i64) -> Result<String, String> {
     let server = state.storage.get_server(server_id)?;
     mihomo::read_remote_config(&server).await
+}
+
+#[tauri::command]
+async fn read_shared_rules(
+    state: State<'_, AppState>,
+    server_id: i64,
+) -> Result<SharedRulesConfig, String> {
+    let server = state.storage.get_server(server_id)?;
+    mihomo::read_shared_rules(&server).await
+}
+
+#[tauri::command]
+async fn save_shared_rules(
+    state: State<'_, AppState>,
+    server_id: i64,
+    rules: String,
+) -> Result<CommandResult, String> {
+    let server = state.storage.get_server(server_id)?;
+    create_indexed_backup(
+        state.storage.clone(),
+        server.clone(),
+        "save_shared_rules".to_string(),
+        Some("保存共享规则前".to_string()),
+    )
+    .await?;
+    let result = mihomo::save_shared_rules(&server, rules).await?;
+    log_command(&state.storage, server_id, "save_shared_rules", &result)?;
+    Ok(result)
 }
 
 fn ensure_tunnel(state: &State<'_, AppState>, server_id: i64) -> Result<u16, String> {
@@ -1372,6 +1408,7 @@ pub fn run() {
             bootstrap_server_with_password,
             delete_server,
             list_operation_logs,
+            clear_operation_logs,
             list_backups,
             create_backup,
             restore_backup,
@@ -1398,7 +1435,9 @@ pub fn run() {
             measure_proxy_node_delay,
             auto_recover_proxy_node,
             read_mihomo_logs,
-            read_mihomo_config
+            read_mihomo_config,
+            read_shared_rules,
+            save_shared_rules
         ])
         .run(tauri::generate_context!())
         .expect("error while running Tauri application");
